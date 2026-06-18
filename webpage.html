@@ -830,6 +830,22 @@
         <label class="switch"><input type="checkbox" id="betaLiteStats"><span class="track"></span></label>
       </div>
       <div class="beta-note">Skips the heavier library, now-playing and storage lookups, showing just uptime and recent activity instead. <b>Monitoring, warnings, errors and notifications are unaffected.</b></div>
+
+      <div class="toggle-line" style="margin-top:14px">
+        <div><div class="tl-text">Blocked file scan <span class="beta-tag">beta</span> <button class="info-btn" onclick="openHelp('malware_scan')" aria-label="About blocked file scan">ⓘ</button></div><div class="tl-sub">Flag Radarr/Sonarr downloads that contain risky file types (.exe, .scr, ...)</div></div>
+        <label class="switch"><input type="checkbox" id="betaMalware"><span class="track"></span></label>
+      </div>
+      <div id="malwareFields" class="sub-block">
+        <div class="toggle-line" style="padding-top:0">
+          <div><div class="tl-text">Auto-remove matches</div><div class="tl-sub">Remove, blocklist, and re-search on its own instead of waiting for you to click</div></div>
+          <label class="switch"><input type="checkbox" id="betaMalwareAuto"><span class="track"></span></label>
+        </div>
+        <div class="field" style="margin-bottom:0">
+          <label>Blocked file extensions (comma-separated)</label>
+          <input id="betaMalwareExts" type="text" placeholder="exe, scr, bat, ...">
+        </div>
+        <div class="beta-note">qBittorrent only, and it only scans the torrents tied to Radarr/Sonarr. By default a match is flagged with a one-click fix; turn on Auto-remove to act automatically (capped to avoid loops). Files inside archives (.rar/.zip) can't be inspected.</div>
+      </div>
     </div>
 
     <div class="modal-actions">
@@ -1519,6 +1535,17 @@ const HELP_TOPICS = {
       </ul>
       <p class="help-note"><b>Nothing happens on its own</b>. Every fix is a button you choose to press, and anything that deletes a download asks you to confirm first. <b>Turning it off</b> hides the buttons <i>and</i> stops the deeper queue checks (so stuck downloads are no longer detected or shown), plus the extra polling. Your core up/down monitoring and alerts keep working either way.</p>`
   },
+  malware_scan: {
+    title: "Blocked file scan", sub: "Catch fake or malware releases",
+    body: `<p>Some "media" torrents are really malware: a tiny video next to a <code>.exe</code>, or a shortcut dressed up as a movie. This scan reads the file list of the torrents tied to Radarr and Sonarr and flags any that contain a blocked file type before you ever open them.</p>
+      <p style="font-weight:600;margin:14px 0 6px">How it behaves</p>
+      <ul style="margin:0 0 14px;padding-left:20px;display:flex;flex-direction:column;gap:6px">
+        <li style="font-size:14px">By default it <b>flags a match</b> on the dashboard with a one-click Remove + blocklist + re-search, so you decide.</li>
+        <li style="font-size:14px"><b>Auto-remove</b> (optional) does that for you automatically, and stops itself if a release keeps coming back, to avoid a loop.</li>
+        <li style="font-size:14px">You set the <b>blocked extensions</b>. The defaults cover executables and scripts; add or remove your own.</li>
+      </ul>
+      <p class="help-note">It only looks at torrents managed by Radarr/Sonarr through <b>qBittorrent</b>, and it can't see inside archives like <code>.rar</code> or <code>.zip</code>.</p>`
+  },
   lite_stats: {
     title: "Lite stats mode", sub: "Easier on low-power servers",
     body: `<p>The Stats panel normally gathers a lot of live detail: total movie/episode counts, what's playing right now, per-server libraries, and drive storage. Each of those means extra requests to Plex, Jellyfin and the *arr apps every time the dashboard refreshes. On a small box (a Pi, a NAS) that's also running those services, it can add up.</p>
@@ -1800,6 +1827,14 @@ function renderBetaSettings(){
   const b=fullConfig.beta||{};
   document.getElementById("betaRemediation").checked = b.remediation !== false;
   document.getElementById("betaLiteStats").checked = !!b.lite_stats;
+  document.getElementById("betaMalware").checked = !!b.malware_scan;
+  document.getElementById("betaMalwareAuto").checked = !!b.malware_autoremove;
+  document.getElementById("betaMalwareExts").value = (b.malware_extensions||[]).join(", ");
+  syncMalwareFields();
+  document.getElementById("betaMalware").onchange = syncMalwareFields;
+}
+function syncMalwareFields(){
+  document.getElementById("malwareFields").classList.toggle("dim", !document.getElementById("betaMalware").checked);
 }
 
 async function testNotify(){
@@ -1918,7 +1953,11 @@ function collectSettings(){
   fullConfig.beta = {
     torrents: true,
     lite_stats: document.getElementById("betaLiteStats").checked,
-    remediation: document.getElementById("betaRemediation").checked
+    remediation: document.getElementById("betaRemediation").checked,
+    malware_scan: document.getElementById("betaMalware").checked,
+    malware_autoremove: document.getElementById("betaMalwareAuto").checked,
+    malware_extensions: document.getElementById("betaMalwareExts").value
+      .split(",").map(s=>s.trim().replace(/^\./,"").toLowerCase()).filter(Boolean)
   };
   // remote access (public endpoint)
   fullConfig.public = {

@@ -50,7 +50,8 @@ DISMISS_FILE = os.path.join(DATA_DIR, "dismissed.json")
 PORT = int(os.environ.get("GUARDTOWARR_PORT", "9595"))  # 9595: avoids Readarr's 8787 and other *arr defaults
 POLL_INTERVAL = 30  # seconds (default)
 
-CURRENT_VERSION = "v1.4.0"
+# Bump this when you cut a new GitHub release (must match the release tag, e.g. v1.0.0).
+CURRENT_VERSION = "v1.4.1"
 GITHUB_REPO = "tonytrawl/GuardTowarr"
 RELEASES_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 RELEASES_PAGE = f"https://github.com/{GITHUB_REPO}/releases/latest"
@@ -62,6 +63,12 @@ RELEASES_PAGE = f"https://github.com/{GITHUB_REPO}/releases/latest"
 # default address, its troubleshooting links, the short blurb shown during
 # setup -- are now all read straight out of that one registry. Add a service
 # there once and it shows up everywhere automatically.
+
+# Default file extensions the blocked-file scan flags inside torrents. These are
+# executable/script types that have no business in a media download, so finding
+# one usually means a fake or malware release. Users can edit this list.
+_DEFAULT_BLOCKED_EXTS = ["exe", "scr", "bat", "cmd", "com", "msi",
+                         "vbs", "js", "jar", "lnk", "pif", "reg", "hta", "ps1"]
 
 DEFAULT_CONFIG = {
     "poll_interval": 30,
@@ -105,7 +112,10 @@ DEFAULT_CONFIG = {
     "beta": {
         "torrents": True,             # show the active-torrents view button (on by default)
         "lite_stats": False,          # skip heavy stats fetches; serve only cheap local data
-        "remediation": True           # diagnose & fix: queue insights + one-click fixes on issues
+        "remediation": True,          # diagnose & fix: queue insights + one-click fixes on issues
+        "malware_scan": False,        # scan arr torrents for blocked file types
+        "malware_autoremove": False,  # auto remove+blocklist+re-search a match (vs flag for a click)
+        "malware_extensions": list(_DEFAULT_BLOCKED_EXTS)
     },
     # The per-service defaults (one entry each for radarr, sonarr, plex, etc.)
     # get filled in from the SERVICE_REGISTRY once it's defined further down.
@@ -177,6 +187,11 @@ def _merge_defaults(cfg):
     beta.setdefault("torrents", True)
     beta.setdefault("lite_stats", False)
     beta.setdefault("remediation", True)
+    beta.setdefault("malware_scan", False)
+    beta.setdefault("malware_autoremove", False)
+    beta.setdefault("malware_extensions", list(_DEFAULT_BLOCKED_EXTS))
+    if not isinstance(beta.get("malware_extensions"), list):
+        beta["malware_extensions"] = list(_DEFAULT_BLOCKED_EXTS)
     pub = cfg.setdefault("public", {})
     if not isinstance(pub, dict): pub = {}; cfg["public"] = pub
     pub.setdefault("enabled", False)
@@ -196,6 +211,27 @@ def _merge_defaults(cfg):
     if not isinstance(svcs, dict):
         svcs = {}
         cfg["services"] = svcs
+    # Migration: Overseerr and Jellyseerr used to be two separate services; they're
+    # now one "seerr" service. Carry an existing user's configured one over to
+    # "seerr", then drop the old entries so they don't linger as duplicate cards.
+    if "seerr" not in svcs:
+        legacy = None
+        for old in ("overseerr", "jellyseerr"):
+            s = svcs.get(old)
+            if isinstance(s, dict) and (str(s.get("api_key", "")).strip() or not s.get("disabled", True)):
+                legacy = s
+                break
+        if legacy is not None:
+            svcs["seerr"] = {
+                "enabled": legacy.get("enabled", True),
+                "disabled": legacy.get("disabled", False),
+                "hidden": legacy.get("hidden", False),
+                "url": legacy.get("url", "http://localhost:5055"),
+                "type": "seerr",
+                "api_key": legacy.get("api_key", ""),
+            }
+    svcs.pop("overseerr", None)
+    svcs.pop("jellyseerr", None)
     for name, default_svc in DEFAULT_CONFIG["services"].items():
         if name not in svcs:
             svcs[name] = dict(default_svc)   # copy so configs don't share the default object
@@ -592,7 +628,7 @@ def svc_result(name, level, summary, errors):
 #   docs          per-situation troubleshooting links, shown on errors/alerts
 #
 # "instances" maps the named services of a type to their default URLs. Most types
-# have one; "arr" covers several apps sharing an API, "seerr" covers two.
+# have one; "arr" is the exception, covering several apps that share an API.
 
 SERVICE_REGISTRY = {
     "arr": {
@@ -658,8 +694,8 @@ SERVICE_REGISTRY = {
         "instances": {"ombi": "http://localhost:5000"},
     },
     "seerr": {
-        "label": "Overseerr / Jellyseerr",
-        "blurb": "Requests",
+        "label": "Seerr",
+        "blurb": "Requests (Overseerr / Jellyseerr)",
         "fields": ["url", "api_key"],
         "checker": check_seerr,
         # Uptime-only for now. The API also exposes request counts and pending
@@ -669,12 +705,10 @@ SERVICE_REGISTRY = {
             "http":        "https://docs.jellyseerr.dev/",
             "unreachable": "https://docs.jellyseerr.dev/getting-started/",
         },
-        # Overseerr and Jellyseerr are the same app (fork), both default to port
-        # 5055 and speak the same API, so they're two instances of one type.
-        # Running both? Change one of the ports in settings after setup.
+        # Overseerr and Jellyseerr share one API, so they're a single service here.
+        # Point it at whichever one you run (both default to port 5055).
         "instances": {
-            "overseerr":   "http://localhost:5055",
-            "jellyseerr":  "http://localhost:5055",
+            "seerr": "http://localhost:5055",
         },
     },
     "jellyfin": {
@@ -1234,9 +1268,10 @@ _QUEUE_ARR = {
 _LOOP_BLOCKLIST_THRESHOLD = 3
 
 # Benign/transient queue warnings the *arr (or Unpackerr) resolves on its own --
-# we must NOT flag these as stuck or offer to remove+blocklist them. The classic
-# one is a completed download that's just an archive waiting to be extracted.
-_BENIGN_QUEUE_MSGS = ("found archive", "extract")
+# we must NOT flag these as stuck or offer to remove+blocklist them. Examples: a
+# completed download that's just an archive waiting to be extracted, or one that
+# already imported successfully and is only lingering while it seeds.
+_BENIGN_QUEUE_MSGS = ("found archive", "extract", "already imported")
 # Genuine-problem phrases: if any of these are present we DO flag, even alongside
 # an otherwise-benign message.
 _PROBLEM_QUEUE_MSGS = ("stalled", "no connection", "no peers", "not enough disk",
@@ -1258,6 +1293,12 @@ def _queue_is_problem(rec):
     tds = (rec.get("trackedDownloadStatus") or "").lower()
     status = (rec.get("status") or "").lower()
     state = (rec.get("trackedDownloadState") or "").lower()
+    # already imported = success. Sonarr/Radarr keep the item in the queue while it
+    # seeds and tag it 'warning', but the file is in your library. Never flag it.
+    # (Note: status 'completed' is NOT a safe skip -- a completed download can still
+    # have a failed import, which we DO want to flag.)
+    if state == "imported":
+        return False
     if tds not in ("warning", "error") and status not in ("failed", "warning"):
         return False
     # genuine failures (bad release, missing files, failed import) always flag
@@ -1403,6 +1444,16 @@ def augment_queue_issues(cfg, results):
                 if not _stall_held(_ARR_STALL_SINCE, dlid, True):
                     provisional = True
 
+            # Import-scan grace: "No files found are eligible for import" is usually
+            # transient (the *arr is still finishing, or extraction hasn't completed)
+            # and clears on the next import pass. Hold off entirely until it has
+            # persisted past the grace window, then flag it as a real stuck import.
+            if (not failed and not manual and not stalling and dlid
+                    and ("eligible for import" in low or "no files found" in low)):
+                arr_seen_stalls.add(dlid)   # shares the transient grace timer + pruning
+                if not _stall_held(_ARR_STALL_SINCE, dlid, True):
+                    continue   # within grace: don't show or flag it yet
+
             # Remove + blocklist + re-search (cause-aware confirmation text).
             remove_act = None
             if not manual and rec.get("id") and rec.get(id_key):
@@ -1486,6 +1537,138 @@ def augment_queue_issues(cfg, results):
     for k in list(_ARR_STALL_SINCE):
         if k not in arr_seen_stalls:
             del _ARR_STALL_SINCE[k]
+
+
+# ----------------------------------------------------------------------------
+# BLOCKED-FILE SCAN  --  catch fake/malware releases (e.g. a torrent that ships a
+# .exe instead of a video). Reads the file list of only the torrents tied to
+# Radarr/Sonarr (matched by hash) from qBittorrent, checks each file's extension
+# against the user's blocklist, and either flags it with a one-click fix
+# (default) or auto-removes it (opt-in). qBittorrent only; archives can't be
+# inspected. Each torrent's files are scanned once and cached.
+# ----------------------------------------------------------------------------
+_MALWARE_SCANNED = {}   # torrent hash -> [] (clean) or [bad filenames]; absent = not scanned
+
+
+def _qbit_scan_files(base, cookie, h, exts):
+    """Return a list of blocked filenames in a torrent, [] if clean, or None if
+    the file list isn't available yet (no metadata) so the caller retries."""
+    try:
+        _, body = http_get(f"{base}/api/v2/torrents/files?hash={urllib.parse.quote(h)}",
+                           auth_cookie=cookie)
+        files = json.loads(body) if body.strip() else []
+    except Exception:
+        return None
+    if not isinstance(files, list) or not files:
+        return None   # metadata not fetched yet
+    bad = []
+    for f in files:
+        nm = (f.get("name") or "")
+        if any(nm.lower().endswith(e) for e in exts):
+            bad.append(nm.rsplit("/", 1)[-1][:60])
+    return bad
+
+
+def scan_blocked_files(cfg, results):
+    """Scan Radarr/Sonarr torrents for blocked file types. Flags a match as an
+    error with a remove+blocklist+re-search action; auto-removes instead when
+    malware_autoremove is on (capped by the blocklist loop guard)."""
+    svcs = cfg["services"]
+    qbit = svcs.get("qbittorrent", {})
+    if qbit.get("disabled") or not qbit.get("url") or not qbit.get("username"):
+        return   # need qBittorrent to read file lists
+    beta = cfg.get("beta", {})
+    exts = []
+    for e in beta.get("malware_extensions", _DEFAULT_BLOCKED_EXTS):
+        e = str(e).strip().lower().lstrip(".")
+        if e:
+            exts.append("." + e)
+    if not exts:
+        return
+    autoremove = bool(beta.get("malware_autoremove"))
+    try:
+        base, cookie = _qbit_login(qbit)
+        if not cookie:
+            return
+        _, body = http_get(f"{base}/api/v2/torrents/info", auth_cookie=cookie)
+        qhashes = {(t.get("hash") or "").lower() for t in (json.loads(body) if body.strip() else [])}
+    except Exception:
+        return
+
+    seen = set()
+    for name, (search_name, ids_field, id_key) in _QUEUE_ARR.items():
+        svc = svcs.get(name, {})
+        if svc.get("disabled") or not svc.get("url") or not svc.get("api_key"):
+            continue
+        res = results.get(name)
+        if not res:
+            continue
+        base_arr = svc["url"].rstrip("/"); key = svc["api_key"]
+        try:
+            q = urllib.parse.urlencode({"pageSize": 200, "includeUnknownMovieItems": "true",
+                                        "includeUnknownSeriesItems": "true"})
+            _, body = http_get(f"{base_arr}/api/v3/queue?{q}", {"X-Api-Key": key}, timeout=15)
+            records = (json.loads(body) if body.strip() else {}).get("records", [])
+        except Exception:
+            continue
+        for rec in records:
+            dlid = (rec.get("downloadId") or "").lower()
+            if not dlid or dlid not in qhashes:
+                continue   # only torrents qBittorrent actually holds
+            seen.add(dlid)
+            found = _MALWARE_SCANNED.get(dlid)
+            if found is None:
+                found = _qbit_scan_files(base, cookie, dlid, exts)
+                if found is None:
+                    continue   # no metadata yet; try again next poll
+                _MALWARE_SCANNED[dlid] = found
+            if not found:
+                continue   # clean
+
+            title = (rec.get("title") or "Unknown release")[:80]
+            badlist = ", ".join(found[:3])
+            item_id = rec.get(id_key)
+            can_fix = bool(rec.get("id") and item_id)
+
+            # auto-remove (opt-in), but stop if we've already burned through several
+            # releases for this item, to avoid an endless remove/re-search loop
+            looping = False
+            if autoremove and can_fix:
+                cnt = _arr_blocklist_counts(base_arr, key, id_key, [item_id]).get(item_id, 0)
+                looping = cnt >= _LOOP_BLOCKLIST_THRESHOLD
+
+            if autoremove and can_fix and not looping:
+                action_queue_fix(name, svc, {"queue_id": rec.get("id"), "search_name": search_name,
+                                             "ids_field": ids_field, "ids": [item_id]})
+                _MALWARE_SCANNED.pop(dlid, None)
+                iss = _issue("warning", title,
+                             f"Blocked file type ({badlist}) found; removed, blocklisted, and searching for a clean release."[:300], "")
+            else:
+                msg = f"Blocked file type in download: {badlist}. Likely a fake or malware release."
+                if looping:
+                    msg += " Auto-remove paused after repeated bad releases; remove manually if you're sure."
+                iss = _issue("error", title, msg[:300], "")
+                if can_fix:
+                    iss["actions"] = [{
+                        "label": "Remove + blocklist + re-search", "action": "queue_fix", "destructive": True,
+                        "confirm": (f"This download contains a blocked file type ({badlist}), which usually "
+                                    "means a fake or malware release. Remove it, blocklist it, and search "
+                                    "for a clean one?"),
+                        "params": {"queue_id": rec.get("id"), "search_name": search_name,
+                                   "ids_field": ids_field, "ids": [item_id]},
+                    }]
+            iss["id"] = _issue_id(name, iss)
+            iss["service"] = name
+            res.setdefault("errors", []).append(iss)
+            lvl = iss["level"]
+            if lvl == "error" and res.get("level") != "error":
+                res["level"] = "error"
+            elif lvl == "warning" and res.get("level") == "ok":
+                res["level"] = "warning"
+
+    for h in list(_MALWARE_SCANNED):   # forget torrents that are gone
+        if h not in seen:
+            del _MALWARE_SCANNED[h]
 
 
 # ----------------------------------------------------------------------------
@@ -2754,6 +2937,12 @@ def run_poll_once():
             augment_queue_issues(cfg, results)
         except Exception as e:
             print(f"[queue] error: {e}")
+    # Blocked-file scan (beta): flag/auto-remove arr torrents carrying risky file types.
+    if cfg.get("beta", {}).get("malware_scan"):
+        try:
+            scan_blocked_files(cfg, results)
+        except Exception as e:
+            print(f"[scan] error: {e}")
     with STATE_LOCK:
         STATE["services"] = results
         STATE["last_poll"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
