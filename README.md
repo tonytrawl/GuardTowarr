@@ -137,6 +137,20 @@ This is the part that sets GuardTowarr apart: it helps you clear the most common
 - **Nothing happens on its own.** Every fix is a button you press, and anything that deletes a download asks you to confirm first.
 - Lives in the **Stability** tab and can be turned off entirely (which also stops the extra queue checks). Your core up/down monitoring and alerts are unaffected either way.
 
+### 📖 Always linked to the fix
+GuardTowarr never leaves you searching for which doc explains an error.
+
+- Every warning and error carries a **direct link to the right documentation**: the matching Servarr wiki page for an *arr health issue, the qBittorrent FAQ for a connection problem, the correct Tunarr config page for an ffmpeg or transcode warning, and so on.
+- Links are **matched to the specific problem**, not just dropped on a generic homepage, so one click takes you to the section that actually covers what you're seeing.
+- Alerts to your phone include the same link, so you can read up on a fix before you're back at your desk.
+
+### 🧪 Blocked-file scan _(beta)_
+An optional check that scans the files inside your Radarr/Sonarr torrents for risky or unwanted extensions (like `.exe` or `.scr` hiding in a release).
+
+- **Off by default**, lives in the **Stability** tab, and the list of blocked extensions is fully editable.
+- By default it just **flags** anything it finds with a one-click remove, so you stay in control. There's an opt-in to have it remove and re-search automatically instead.
+
+
 ### 📱 Phone & chat alerts
 - Get pinged when something breaks (and again when it recovers) via any mix of **[ntfy](https://ntfy.sh)** (free phone push, no account needed), **Discord** (channel webhook), or **[Pushover](https://pushover.net)**. Turn on one channel or several.
 - Only alerts on **real changes**, so no spam while something stays down.
