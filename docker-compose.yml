@@ -1,0 +1,26 @@
+services:
+  guardtowarr:
+    image: tonytrawl/guardtowarr:latest
+    container_name: guardtowarr
+    ports:
+      # Main dashboard. This is the full, trusted dashboard (shows everything,
+      # including credentials in Settings) and has NO login. Keep it on your LAN
+      # only -- do NOT expose this port to the internet.
+      - "9595:9595"
+      #
+      # Remote-access port (OPTIONAL -- only if you turn on "Remote access" in
+      # Settings > General). This is the restricted, token-protected view meant to
+      # be reached from outside your network. Uncomment the line below to publish it.
+      # IF YOU DO use remote access: expose THIS port (9596), never 9595, and put it
+      #   behind an HTTPS reverse proxy with its own login (Authelia/Authentik/
+      #   Cloudflare Access/NPM basic auth). Never forward it raw to the internet.
+      # IF YOU DON'T use remote access: leave it commented out -- you don't need it.
+      # - "9596:9596"
+    volumes:
+      - ./config:/config        # settings, dismissed issues, and history persist here
+    restart: unless-stopped
+    # If your Radarr/Sonarr/Plex/etc. run on this same machine, the container can't
+    # reach them via "localhost" (that points at the container itself). Use either:
+    #   1) your host's LAN IP in the service URLs (e.g. http://192.168.1.50:7878), or
+    #   2) host networking by uncommenting the line below and removing the "ports" block.
+    # network_mode: host

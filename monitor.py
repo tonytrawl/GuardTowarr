@@ -22,8 +22,15 @@ import json
 import os
 import sys
 import time
+import base64
 import hashlib
 import hmac
+import copy
+import re
+import tempfile
+import shutil
+import socket
+import http.client
 import threading
 import concurrent.futures
 import http.server
@@ -51,7 +58,7 @@ PORT = int(os.environ.get("GUARDTOWARR_PORT", "9595"))  # 9595: avoids Readarr's
 POLL_INTERVAL = 30  # seconds (default)
 
 # Bump this when you cut a new GitHub release (must match the release tag, e.g. v1.0.0).
-CURRENT_VERSION = "v1.4.1"
+CURRENT_VERSION = "v2.0.0"
 GITHUB_REPO = "tonytrawl/GuardTowarr"
 RELEASES_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 RELEASES_PAGE = f"https://github.com/{GITHUB_REPO}/releases/latest"
@@ -102,7 +109,14 @@ DEFAULT_CONFIG = {
         "ntfy_enabled": True,         # send alerts via ntfy (when a topic is set)
         "pushover_enabled": False,    # send alerts via Pushover
         "pushover_token": "",         # Pushover application API token
-        "pushover_user": ""           # Pushover user (or group) key
+        "pushover_user": "",          # Pushover user (or group) key
+        "telegram_enabled": False,    # send alerts via a Telegram bot
+        "telegram_token": "",         # Telegram bot token (from @BotFather)
+        "telegram_chat": "",          # Telegram chat id to send to
+        # When a service the others depend on goes down (Prowlarr -> indexers,
+        # a download client -> the *arr download-client check), suppress the
+        # downstream apps' duplicate alerts and let the root cause alert alone.
+        "dependency_aware": True
     },
     "ui": {
         "sound_enabled": False,       # chime/flash on new error
@@ -125,12 +139,41 @@ DEFAULT_CONFIG = {
 }
 
 # Live, thread-safe config shared by poller + web handler.
-CONFIG_LOCK = threading.Lock()
+CONFIG_LOCK = threading.RLock()
 CONFIG = {}
 
 # shared state, written by poller, read by webserver
 STATE_LOCK = threading.Lock()
 STATE = {"last_poll": None, "services": {}}
+
+
+def atomic_json(path, value):
+    """Replace a complete, flushed file; never truncate the last good copy."""
+    fd, tmp = tempfile.mkstemp(prefix=".guardtowarr-", dir=os.path.dirname(os.path.abspath(path)))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(value, f, indent=2, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def service_app(name, svc):
+    return svc.get("app") or name
+
+
+def active_instances(cfg, apps=None, stype=None):
+    return [(n, s) for n, s in cfg.get("services", {}).items()
+            if isinstance(s, dict) and not s.get("disabled", True) and s.get("enabled", True)
+            and (apps is None or service_app(n, s) in apps)
+            and (stype is None or s.get("type") == stype)]
+
+
+def queue_instances(cfg):
+    return [(n, _QUEUE_ARR[service_app(n, s)]) for n, s in active_instances(cfg, _QUEUE_ARR)]
 
 
 def _merge_defaults(cfg):
@@ -144,6 +187,19 @@ def _merge_defaults(cfg):
     # setup_complete inference below) is safe even if the file had services:null.
     if not isinstance(cfg.get("services"), dict):
         cfg["services"] = {}
+    cfg = copy.deepcopy(cfg)
+    cfg["services"] = {n: s for n, s in cfg["services"].items()
+                       if isinstance(n, str) and re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", n)
+                       and isinstance(s, dict)}
+    for name, svc in cfg["services"].items():
+        app = svc.get("app", name)
+        if not isinstance(app, str):
+            app = name
+        svc["app"] = app
+        template = DEFAULT_CONFIG["services"].get(app, {})
+        for key, value in template.items():
+            if key in svc and not isinstance(svc[key], type(value)):
+                svc[key] = copy.deepcopy(value)
     cfg.setdefault("poll_interval", 30)
     # "setup_complete" was added in a later version. If it's missing, this config
     # was written by an older build. Don't drag those users back through first-run
@@ -177,6 +233,10 @@ def _merge_defaults(cfg):
     notif.setdefault("pushover_enabled", False)
     notif.setdefault("pushover_token", "")
     notif.setdefault("pushover_user", "")
+    notif.setdefault("telegram_enabled", False)
+    notif.setdefault("telegram_token", "")
+    notif.setdefault("telegram_chat", "")
+    notif.setdefault("dependency_aware", True)
     ui = cfg.setdefault("ui", {})
     if not isinstance(ui, dict): ui = {}; cfg["ui"] = ui
     ui.setdefault("sound_enabled", False)
@@ -236,36 +296,56 @@ def _merge_defaults(cfg):
         if name not in svcs:
             svcs[name] = dict(default_svc)   # copy so configs don't share the default object
     for name, svc in svcs.items():
+        template = DEFAULT_CONFIG["services"].get(svc.get("app", name), {})
+        for key, value in template.items():
+            svc.setdefault(key, copy.deepcopy(value))
+        svc.setdefault("app", name)
+        svc.setdefault("label", name)
         svc.setdefault("enabled", True)
         svc.setdefault("disabled", False)
         svc.setdefault("hidden", False)
+    for key, fallback, low, high in (("poll_interval", 30, 5, 3600), ("port", 9595, 1, 65535)):
+        try:
+            cfg[key] = max(low, min(high, int(cfg.get(key, fallback))))
+        except (TypeError, ValueError, OverflowError):
+            cfg[key] = fallback
+    if not isinstance(cfg.get("default_profiles"), dict):
+        cfg["default_profiles"] = {}
+    for section in ("notifications", "ui", "beta", "public"):
+        for key, default in DEFAULT_CONFIG[section].items():
+            if not isinstance(cfg[section].get(key), type(default)):
+                cfg[section][key] = copy.deepcopy(default)
+    cfg["schema_version"] = 2
     return cfg
 
 
 def load_config():
     if not os.path.exists(CONFIG_FILE):
-        with open(CONFIG_FILE, "w") as f:
-            json.dump(DEFAULT_CONFIG, f, indent=2)
+        atomic_json(CONFIG_FILE, DEFAULT_CONFIG)
         print(f"[*] Created {CONFIG_FILE}.")
     # Read and merge. If the file is empty, corrupt, or not valid JSON (which can
     # happen with a hand-edited or half-written mounted config), don't crash --
     # fall back to defaults via _merge_defaults, which tolerates a non-dict input.
     try:
-        with open(CONFIG_FILE) as f:
+        with open(CONFIG_FILE, encoding="utf-8-sig") as f:
             raw = json.load(f)
     except (json.JSONDecodeError, ValueError):
         print(f"[!] {CONFIG_FILE} was empty or invalid JSON; starting from defaults.")
+        shutil.copy2(CONFIG_FILE, CONFIG_FILE + ".corrupt-" + str(time.time_ns()))
         raw = {}
     except Exception as e:
         print(f"[!] Couldn't read {CONFIG_FILE} ({e}); starting from defaults.")
-        raw = {}
+        raise RuntimeError("Configuration cannot be read; leaving the original file untouched") from e
+    if not isinstance(raw, dict) or not isinstance(raw.get("services", {}), dict) or any(
+            not isinstance(s, dict) for s in (raw.get("services", {}) if isinstance(raw, dict)
+                                             and isinstance(raw.get("services", {}), dict) else {}).values()):
+        shutil.copy2(CONFIG_FILE, CONFIG_FILE + ".recovered-" + str(time.time_ns()))
     return _merge_defaults(raw)
 
 
 def save_config(cfg):
     with CONFIG_LOCK:
-        with open(CONFIG_FILE, "w") as f:
-            json.dump(cfg, f, indent=2)
+        atomic_json(CONFIG_FILE, cfg)
 
 
 def get_config():
@@ -279,11 +359,28 @@ def missing_credentials(svc):
     return [f for f in req if not str(svc.get(f, "")).strip()]
 
 
+class SameOriginRedirect(urllib.request.HTTPRedirectHandler):
+    """Never forward service credentials or request bodies to another origin."""
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        def origin(url):
+            p = urllib.parse.urlsplit(url)
+            return p.scheme.lower(), p.hostname, p.port or (443 if p.scheme == "https" else 80)
+        if origin(req.full_url) != origin(newurl):
+            raise urllib.error.HTTPError(req.full_url, code, "Cross-origin redirect blocked", headers, fp)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def safe_urlopen(req, timeout=10):
+    if urllib.parse.urlsplit(req.full_url).scheme not in ("http", "https"):
+        raise ValueError("Only HTTP(S) requests are supported.")
+    return urllib.request.build_opener(SameOriginRedirect()).open(req, timeout=timeout)
+
+
 def http_get(url, headers=None, timeout=10, auth_cookie=None):
     req = urllib.request.Request(url, headers=headers or {})
     if auth_cookie:
         req.add_header("Cookie", auth_cookie)
-    with urllib.request.urlopen(req, timeout=timeout) as r:
+    with safe_urlopen(req, timeout=timeout) as r:
         return r.status, r.read().decode("utf-8", "replace")
 
 
@@ -328,7 +425,7 @@ def check_arr(name, cfg):
     headers = {"X-Api-Key": key}
     # Radarr and Sonarr are on API v3. The newer/older siblings -- Prowlarr,
     # Readarr, Lidarr -- all live under /api/v1. Everything else here is identical.
-    api = "v1" if name in ("prowlarr", "readarr", "lidarr") else "v3"
+    api = _arr_api_ver(service_app(name, cfg))
     try:
         # ping system status first
         status, body = http_get(f"{base}/api/{api}/system/status", headers)
@@ -411,7 +508,7 @@ def check_qbit(name, cfg):
         }).encode()
         req = urllib.request.Request(f"{base}/api/v2/auth/login", data=data,
                                      headers={"Referer": base})
-        with urllib.request.urlopen(req, timeout=10) as r:
+        with safe_urlopen(req, timeout=10) as r:
             cookie = r.headers.get("Set-Cookie", "")
             login_body = r.read().decode().strip()
         if login_body != "Ok." and not cookie:
@@ -430,9 +527,9 @@ def check_qbit(name, cfg):
             st = t.get("state", "")
             h = t.get("hash", "")
             if h:
-                seen_hashes.add(h)
+                seen_hashes.add((name, h))
             is_stalled = (st == "stalledDL")
-            held = _stall_held(_QBIT_STALL_SINCE, h, is_stalled)
+            held = _stall_held(_QBIT_STALL_SINCE, (name, h), is_stalled)
             if st in bad_states:
                 iss = _issue(
                     "error" if st in ("error", "missingFiles") else "warning",
@@ -448,8 +545,8 @@ def check_qbit(name, cfg):
                 errs.append(iss)
         # prune stall timers for torrents that are no longer present
         for k in list(_QBIT_STALL_SINCE):
-            if k not in seen_hashes:
-                del _QBIT_STALL_SINCE[k]
+            if isinstance(k, tuple) and k[0] == name and k not in seen_hashes:
+                _QBIT_STALL_SINCE.pop(k, None)
         if any(e["level"] == "error" for e in errs):
             return svc_result(name, "error", f"{len(errs)} torrent error(s)", errs)
         if errs:
@@ -586,6 +683,192 @@ def check_tunarr(name, cfg):
                     DOC_LINKS.get("tunarr_unreachable", ""))])
 
 
+def check_sabnzbd(name, cfg):
+    try:
+        queue = sab_data(cfg, "queue", start=0, limit=1000)
+        issues = []
+        if queue.get("paused") or queue.get("status", "").lower() == "paused":
+            issues.append(_issue("warning", "Queue", "SABnzbd downloading is paused."))
+        for row in queue.get("slots", []):
+            if row.get("status", "").lower() in ("failed", "missing", "error"):
+                issues.append(_issue("error", row.get("filename", "Download"),
+                                     "SABnzbd queue item: " + row.get("status", "")))
+        try:
+            history = sab_data(cfg, "history", start=0, limit=100, failed_only=1)
+            for row in history.get("slots", []):
+                if row.get("status", "").lower() == "failed" and float(row.get("completed", 0) or 0) >= time.time()-86400:
+                    issues.append(_issue("error", row.get("name", "Download"), row.get("fail_message") or "Download failed."))
+        except Exception:
+            issues.append(_issue("warning", "History", "Queue is reachable, but failed-download history could not be read."))
+        for issue in issues:
+            issue["fix"] = "https://sabnzbd.org/wiki/"
+        level = "error" if any(i["level"] == "error" for i in issues) else "warning" if issues else "ok"
+        return svc_result(name, level, f"{len(issues)} issue(s)" if issues else f"Online ({queue.get('noofslots', len(queue.get('slots', [])))} queued)", issues)
+    except Exception as e:
+        return svc_result(name, "error", f"SABnzbd unavailable: {e}", [])
+
+
+def sab_data(svc, mode, **params):
+    query = urllib.parse.urlencode(dict(mode=mode, output="json", apikey=svc.get("api_key", ""), **params))
+    _, body = http_get(svc["url"].rstrip("/") + "/api?" + query)
+    data = json.loads(body)
+    if data.get("error"):
+        raise ValueError("SABnzbd rejected the request; check its API key and access settings.")
+    if not isinstance(data.get(mode), dict):
+        raise ValueError("Unexpected SABnzbd response")
+    return data[mode]
+
+
+def check_cleanuparr(name, cfg):
+    """Read Cleanuparr's own health reports; never trigger its cleanup jobs."""
+    try:
+        headers = {"X-Api-Key": cfg.get("api_key", "")}
+        base = cfg["url"].rstrip("/")
+        try:
+            _, body = http_get(base + "/health/detailed", headers)
+        except urllib.error.HTTPError as e:
+            if e.code != 503:
+                raise
+            body = e.read().decode("utf-8")
+        health = json.loads(body)
+        if not isinstance(health, dict) or "status" not in health:
+            raise ValueError("Unsupported health response")
+        issues = []
+        for source, item in health.get("entries", {}).items():
+            if str(item.get("status", "")).lower() != "healthy":
+                level = "warning" if item.get("status", "").lower() == "degraded" else "error"
+                issues.append(_issue(level, source, item.get("description") or "Health check failed",
+                                     "https://cleanuparr.github.io/docs/"))
+        if not issues and str(health["status"]).lower() != "healthy":
+            issues.append(_issue("error", "Health", "Cleanuparr reports an unhealthy state."))
+        try:
+            _, body = http_get(base + "/api/manualevents?isResolved=false&page=1&pageSize=100", headers)
+            events = json.loads(body)
+            for event in events.get("items", []):
+                if event.get("isResolved"):
+                    continue
+                severity = str(event.get("severity", "warning")).lower()
+                issue = _issue("error" if severity in ("error", "critical") else "warning",
+                               event.get("itemTitle") or "Action required",
+                               event.get("message") or "Cleanuparr needs attention.", base)
+                issue["external_id"] = event.get("id")
+                issues.append(issue)
+            if events.get("totalCount", 0) > len(events.get("items", [])):
+                issues.append(_issue("warning", "Action required", "More unresolved events are available in Cleanuparr.", base))
+        except Exception:
+            issues.append(_issue("warning", "Events", "Health is available, but action-required events could not be loaded."))
+        level = "error" if any(i["level"] == "error" for i in issues) else "warning" if issues else "ok"
+        return svc_result(name, level, f"{len(issues)} health issue(s)" if issues else "Healthy", issues)
+    except urllib.error.HTTPError as e:
+        return svc_result(name, "error", "API key rejected" if e.code in (401, 403) else f"HTTP {e.code}", [])
+    except Exception as e:
+        return svc_result(name, "error", f"Cleanuparr health unavailable: {e}", [])
+
+
+class UnixHTTPConnection(http.client.HTTPConnection):
+    def __init__(self, path):
+        super().__init__("localhost", timeout=10)
+        self.socket_path = path
+
+    def connect(self):
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.settimeout(self.timeout)
+        self.sock.connect(self.socket_path)
+
+
+def docker_containers(svc):
+    """Only GET /containers/json. No container control or arbitrary API proxy."""
+    endpoint = svc.get("url", "")
+    if endpoint.startswith("unix://"):
+        if not hasattr(socket, "AF_UNIX"):
+            raise ValueError("Use an HTTP socket proxy on this platform.")
+        conn = UnixHTTPConnection(endpoint[len("unix://"):])
+        try:
+            conn.request("GET", "/containers/json?all=1")
+            response = conn.getresponse()
+            if response.status != 200:
+                raise ValueError(f"Docker returned HTTP {response.status}")
+            return json.loads(response.read(4 * 1024 * 1024))
+        finally:
+            conn.close()
+    if urllib.parse.urlsplit(endpoint).scheme not in ("http", "https"):
+        raise ValueError("Use unix:///var/run/docker.sock or an HTTP(S) Docker socket proxy.")
+    _, body = http_get(endpoint.rstrip("/") + "/containers/json?all=1")
+    data = json.loads(body)
+    if not isinstance(data, list):
+        raise ValueError("Docker returned an unexpected response.")
+    return data
+
+
+def check_docker(name, cfg):
+    try:
+        containers = docker_containers(cfg)
+        selected = {v.strip() for v in cfg.get("containers", "").split(",") if v.strip()}
+        seen, issues, rows = set(), [], []
+        for item in containers:
+            names = [n.lstrip("/") for n in item.get("Names", [])]
+            label = names[0] if names else item.get("Id", "")[:12]
+            if selected and not selected.intersection(names):
+                continue
+            seen.update(names)
+            state, status = item.get("State", "unknown"), item.get("Status", "")
+            rows.append({"name": label, "state": state, "status": status})
+            if state != "running" or "(unhealthy)" in status:
+                issues.append(_issue("error", label, f"Container {state}: {status}",
+                                     "https://docs.docker.com/engine/containers/run/"))
+        for missing in selected - seen:
+            issues.append(_issue("error", missing, "Configured container is missing."))
+        result = svc_result(name, "error" if issues else "ok",
+                            f"{len(issues)} container issue(s)" if issues else f"{len(rows)} containers running", issues)
+        result["containers"] = rows
+        return result
+    except Exception as e:
+        return svc_result(name, "error", f"Docker unavailable: {e}", [])
+
+
+def check_nzbget(name, cfg):
+    """NZBGet (Usenet downloader, beta). Talks JSON-RPC at /jsonrpc with HTTP basic
+    auth (username/password). We call the 'status' method; a valid response means
+    it's up. A 401 means bad credentials; a paused queue is surfaced as a warning."""
+    base = cfg["url"].rstrip("/")
+    user = cfg.get("username", "")
+    pw = cfg.get("password", "")
+    try:
+        payload = json.dumps({"method": "status", "params": [], "id": 1}).encode()
+        req = urllib.request.Request(f"{base}/jsonrpc", data=payload,
+                                     headers={"Content-Type": "application/json"})
+        if user or pw:
+            token = base64.b64encode(f"{user}:{pw}".encode()).decode()
+            req.add_header("Authorization", f"Basic {token}")
+        with safe_urlopen(req, timeout=10) as r:
+            status, body = r.status, r.read().decode("utf-8", "replace")
+        if status != 200:
+            return svc_result(name, "error", f"NZBGet returned HTTP {status}",
+                [_issue("error", "Connection", f"NZBGet returned HTTP {status}.",
+                        DOC_LINKS.get("nzbget_http", ""))])
+        data = json.loads(body) if body.strip() else {}
+        result = data.get("result", {}) if isinstance(data, dict) else {}
+        if isinstance(result, dict) and result.get("DownloadPaused"):
+            return svc_result(name, "warning", "Downloads paused",
+                [_issue("warning", "Queue", "NZBGet downloading is paused.",
+                        DOC_LINKS.get("nzbget_http", ""))])
+        return svc_result(name, "ok", "Online", [])
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            return svc_result(name, "error", "Login failed (check username/password)",
+                [_issue("error", "Authentication",
+                        "NZBGet rejected the login. Check the username and password.",
+                        DOC_LINKS.get("nzbget_login", ""))])
+        return svc_result(name, "error", f"NZBGet returned HTTP {e.code}",
+            [_issue("error", "Connection", f"NZBGet returned HTTP {e.code}: {e.reason}.",
+                    DOC_LINKS.get("nzbget_http", ""))])
+    except Exception as e:
+        return svc_result(name, "error", f"Unreachable: {e}",
+            [_issue("error", "Unreachable",
+                    "Couldn't reach NZBGet. Check the address and that the service is running.",
+                    DOC_LINKS.get("nzbget_unreachable", ""))])
+
+
 def _issue_id(name, e):
     """Stable content-hash id for an issue, so dismissals survive re-polling.
     Shared by svc_result and the queue scan so both build ids the same way."""
@@ -631,6 +914,18 @@ def svc_result(name, level, summary, errors):
 # have one; "arr" is the exception, covering several apps that share an API.
 
 SERVICE_REGISTRY = {
+    "cleanuparr": {
+        "label": "Cleanuparr", "blurb": "Cleanup service health and reported problems",
+        "fields": ["url", "api_key"], "checker": check_cleanuparr,
+        "capabilities": ["monitor"], "docs": {"http": "https://cleanuparr.github.io/docs/"},
+        "instances": {"cleanuparr": "http://localhost:11011"},
+    },
+    "docker": {
+        "label": "Docker", "blurb": "Container status through a socket or restricted proxy",
+        "fields": ["url"], "checker": check_docker, "capabilities": ["monitor"],
+        "docs": {"http": "https://docs.docker.com/engine/"},
+        "instances": {"docker": "http://docker-socket-proxy:2375"},
+    },
     "arr": {
         "label": "Arr",
         "blurb": "Movies / TV / indexer",
@@ -738,6 +1033,33 @@ SERVICE_REGISTRY = {
         },
         "instances": {"tunarr": "http://localhost:8000"},
     },
+    "sabnzbd": {
+        "label": "SABnzbd",
+        "blurb": "Usenet downloader (beta)",
+        "fields": ["url", "api_key"],
+        "checker": check_sabnzbd,
+        # Beta: monitoring only (up/down + paused). The API also exposes the queue,
+        # so a "queue" capability + hook could feed the active-downloads view later.
+        "capabilities": ["monitor"],
+        "docs": {
+            "http":        "https://sabnzbd.org/wiki/configuration/4.3/general",
+            "unreachable": "https://sabnzbd.org/wiki/",
+        },
+        "instances": {"sabnzbd": "http://localhost:8080"},
+    },
+    "nzbget": {
+        "label": "NZBGet",
+        "blurb": "Usenet downloader (beta)",
+        "fields": ["url", "username", "password"],
+        "checker": check_nzbget,
+        "capabilities": ["monitor"],
+        "docs": {
+            "http":        "https://nzbget.com/documentation/",
+            "login":       "https://nzbget.com/documentation/access-control/",
+            "unreachable": "https://nzbget.com/documentation/",
+        },
+        "instances": {"nzbget": "http://localhost:6789"},
+    },
 }
 
 
@@ -782,7 +1104,7 @@ def _build_default_services():
     out = {}
     for stype, spec in SERVICE_REGISTRY.items():
         for inst_name, default_url in spec["instances"].items():
-            entry = {"enabled": True, "disabled": True, "hidden": False,
+            entry = {"enabled": True, "disabled": True, "hidden": False, "app": inst_name, "label": inst_name,
                      "url": default_url, "type": stype}
             # give each credential field (everything except url) a blank default
             for f in spec["fields"]:
@@ -830,7 +1152,7 @@ def _arr_post(base, path, key, payload, timeout=30):
         headers={"X-Api-Key": key, "Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=timeout) as r:
+    with safe_urlopen(req, timeout=timeout) as r:
         return r.status, r.read().decode("utf-8", "replace")
 
 
@@ -872,7 +1194,7 @@ MEDIA_KINDS = {
 }
 
 
-def media_search(cfg, kind, term):
+def media_search(cfg, kind, term, service=None):
     """Search a media service for something to add. Which service and endpoint
     to use comes from MEDIA_KINDS. Only works if that service is set up (has a
     url + api key) and isn't disabled -- otherwise it returns a friendly error
@@ -880,8 +1202,10 @@ def media_search(cfg, kind, term):
     spec = MEDIA_KINDS.get(kind)
     if not spec:
         return {"ok": False, "error": f"Don't know how to search for '{kind}'."}
-    svc_name = spec["service"]
+    svc_name = resolve_media_service(cfg, kind, service)
     svc = cfg["services"].get(svc_name, {})
+    if not svc:
+        return {"ok": False, "error": "Select a configured instance for this media kind."}
     # gate: the service must exist, be enabled, and have its credentials
     if svc.get("disabled") or not svc.get("url") or not svc.get("api_key"):
         return {"ok": False, "error": f"{spec['label']} is not configured."}
@@ -921,10 +1245,14 @@ def media_search(cfg, kind, term):
         return {"ok": False, "error": f"Search failed: {e}"}
 
 
-def media_profiles(cfg, kind):
+def media_profiles(cfg, kind, service=None):
     """Return the quality profiles for Radarr (movie) or Sonarr (series)."""
-    svc_name = "radarr" if kind == "movie" else "sonarr"
+    if kind not in ("movie", "series"):
+        return {"ok": False, "error": "Books and music are search-only. Add them in Readarr or Lidarr."}
+    svc_name = resolve_media_service(cfg, kind, service)
     svc = cfg["services"].get(svc_name, {})
+    if not svc:
+        return {"ok": False, "error": "Select a configured instance for this media kind."}
     if svc.get("disabled") or not svc.get("url") or not svc.get("api_key"):
         return {"ok": False, "error": f"{svc_name.title()} is not configured."}
     base = svc["url"].rstrip("/")
@@ -932,11 +1260,14 @@ def media_profiles(cfg, kind):
     try:
         _, body = http_get(f"{base}/api/v3/qualityprofile", {"X-Api-Key": key})
         profiles = json.loads(body) if body.strip() else []
-        default = (cfg.get("default_profiles") or {}).get("movie" if kind == "movie" else "series")
+        _, root_body = http_get(f"{base}/api/v3/rootfolder", {"X-Api-Key": key})
+        roots = json.loads(root_body)
+        default = (cfg.get("default_profiles") or {}).get(svc_name, (cfg.get("default_profiles") or {}).get(kind))
         return {
             "ok": True,
             "profiles": [{"id": p.get("id"), "name": p.get("name", "")} for p in profiles],
             "default": default,
+            "roots": [{"path": r.get("path"), "id": r.get("id")} for r in roots],
         }
     except urllib.error.HTTPError as e:
         return {"ok": False, "error": f"HTTP {e.code}: {e.reason}"}
@@ -944,11 +1275,15 @@ def media_profiles(cfg, kind):
         return {"ok": False, "error": f"Couldn't load profiles: {e}"}
 
 
-def media_add(cfg, kind, item, profile_id=None):
+def media_add(cfg, kind, item, profile_id=None, service=None, root_folder=None):
     """Add a movie (Radarr) or series (Sonarr). Uses the first root folder; quality
     profile is the chosen profile_id, or the first available if none given."""
-    svc_name = "radarr" if kind == "movie" else "sonarr"
+    if kind not in ("movie", "series"):
+        return {"ok": False, "error": "Books and music are search-only. Add them in Readarr or Lidarr."}
+    svc_name = resolve_media_service(cfg, kind, service)
     svc = cfg["services"].get(svc_name, {})
+    if not svc:
+        return {"ok": False, "error": "Select a configured instance for this media kind."}
     if svc.get("disabled") or not svc.get("url") or not svc.get("api_key"):
         return {"ok": False, "error": f"{svc_name.title()} is not configured."}
     base = svc["url"].rstrip("/")
@@ -959,13 +1294,20 @@ def media_add(cfg, kind, item, profile_id=None):
         roots = json.loads(rf_body) if rf_body.strip() else []
         if not roots:
             return {"ok": False, "error": f"No root folder set in {svc_name.title()}."}
-        root_path = roots[0].get("path", "")
+        root_path = next((r.get("path") for r in roots if r.get("id") == root_folder), None) if isinstance(root_folder, int) else root_folder
+        if isinstance(root_folder, int) and root_path is None:
+            return {"ok": False, "error": "Selected root folder no longer exists."}
+        root_path = root_path or roots[0].get("path", "")
+        if root_path not in {r.get("path") for r in roots}:
+            return {"ok": False, "error": "Selected root folder no longer exists."}
         _, qp_body = http_get(f"{base}/api/v3/qualityprofile", {"X-Api-Key": key})
         profiles = json.loads(qp_body) if qp_body.strip() else []
         if not profiles:
             return {"ok": False, "error": f"No quality profile in {svc_name.title()}."}
         valid_ids = {p.get("id") for p in profiles}
-        qid = profile_id if profile_id in valid_ids else profiles[0].get("id", 1)
+        if profile_id is not None and profile_id not in valid_ids:
+            return {"ok": False, "error": "Selected quality profile no longer exists."}
+        qid = profile_id if profile_id is not None else profiles[0].get("id", 1)
 
         if kind == "movie":
             payload = {
@@ -1010,14 +1352,14 @@ def _qbit_login(svc):
         "username": svc.get("username", ""), "password": svc.get("password", "")
     }).encode()
     req = urllib.request.Request(f"{base}/api/v2/auth/login", data=data, headers={"Referer": base})
-    with urllib.request.urlopen(req, timeout=10) as r:
+    with safe_urlopen(req, timeout=10) as r:
         cookie = r.headers.get("Set-Cookie", "")
     return base, (cookie.split(";")[0] if cookie else None)
 
 
 # qBittorrent states grouped into the two tabs
-_DOWNLOADING_STATES = {"downloading", "stalledDL", "metaDL", "queuedDL", "forcedDL", "checkingDL", "allocating", "pausedDL"}
-_SEEDING_STATES = {"uploading", "stalledUP", "queuedUP", "forcedUP", "checkingUP", "pausedUP"}
+_DOWNLOADING_STATES = {"downloading", "stalledDL", "metaDL", "queuedDL", "forcedDL", "checkingDL", "allocating", "pausedDL", "stoppedDL"}
+_SEEDING_STATES = {"uploading", "stalledUP", "queuedUP", "forcedUP", "checkingUP", "pausedUP", "stoppedUP"}
 
 
 def _qbit_configured(cfg):
@@ -1036,6 +1378,7 @@ def _get_torrents_qbit(cfg):
         st = t.get("state", "")
         prog = t.get("progress", 0) or 0
         row = {
+            "id": t.get("hash", ""), "protocol": "torrent",
             "name": t.get("name", "")[:120],
             "state": st,
             "progress": round(prog * 100, 1),
@@ -1099,18 +1442,47 @@ def _get_torrents_arr_queue(cfg):
 
 
 def get_torrents(cfg):
-    """Active torrents. Uses qBittorrent when configured (full data, downloading+seeding);
-    otherwise falls back to the Radarr/Sonarr download queue (downloading only)."""
-    if _qbit_configured(cfg):
+    out = {"ok": True, "source": "combined", "downloading": [], "seeding": [], "errors": []}
+    known = set()
+    for name, svc in active_instances(cfg):
+        if svc.get("type") not in ("qbit", "sabnzbd"):
+            continue
         try:
-            return _get_torrents_qbit(cfg)
+            if svc["type"] == "qbit":
+                data = _get_torrents_qbit({"services": {"qbittorrent": svc}})
+            else:
+                queue = sab_data(svc, "queue", start=0, limit=1000)
+                rows = []
+                for r in queue.get("slots", []):
+                    total = float(r.get("mb", 0) or 0) * 1048576
+                    rows.append({"name": r.get("filename", "Download"), "state": r.get("status", ""),
+                                 "progress": float(r.get("percentage", 0) or 0), "size": total,
+                                 "dlspeed": float(r.get("kbpersec", 0) or 0) * 1024,
+                                 "upspeed": 0, "eta": duration_seconds(r.get("timeleft", "")),
+                                 "id": r.get("nzo_id", ""), "protocol": "usenet"})
+                data = {"downloading": rows, "seeding": []}
+            for tab in ("downloading", "seeding"):
+                for row in data.get(tab, []):
+                    row.update(app=name, client=svc.get("label", name))
+                    known.add(str(row.get("id", "")).lower())
+                    out[tab].append(row)
         except Exception as e:
-            # qBit set up but unreachable, so surface the error rather than silently falling back
-            return {"ok": False, "error": f"Couldn't load torrents: {e}"}
-    # no qBittorrent configured → client-agnostic fallback via the *arr queue
-    if cfg["services"].get("radarr", {}).get("api_key") or cfg["services"].get("sonarr", {}).get("api_key"):
-        return _get_torrents_arr_queue(cfg)
-    return {"ok": False, "error": "Configure qBittorrent, or Radarr/Sonarr, to see downloads."}
+            out["errors"].append(f"{svc.get('label', name)}: {e}")
+    for name, svc in active_instances(cfg, ("radarr", "sonarr")):
+        try:
+            for r in arr_queue_records(svc):
+                ident = str(r.get("downloadId", "")).lower()
+                if ident and ident in known:
+                    continue
+                known.add(ident)
+                total = r.get("size", 0) or 0
+                out["downloading"].append({"id": ident, "name": r.get("title", ""), "state": r.get("status", ""),
+                    "progress": round(100*(1-(r.get("sizeleft", 0) or 0)/total), 1) if total else 0,
+                    "size": total, "dlspeed": 0, "upspeed": 0, "eta": duration_seconds(r.get("timeleft", "")),
+                    "app": name, "client": svc.get("label", name), "protocol": "queue"})
+        except Exception as e:
+            out["errors"].append(f"{svc.get('label', name)} queue: {e}")
+    return out
 
 
 # ----------------------------------------------------------------------------
@@ -1131,7 +1503,7 @@ def _arr_api_ver(name):
 
 def _http_request(method, url, headers=None, data=None, timeout=20):
     req = urllib.request.Request(url, data=data, headers=headers or {}, method=method)
-    with urllib.request.urlopen(req, timeout=timeout) as r:
+    with safe_urlopen(req, timeout=timeout) as r:
         return r.status, r.read().decode("utf-8", "replace")
 
 
@@ -1140,7 +1512,7 @@ def _arr_testall(svc_name, svc, endpoint, label):
     base = svc.get("url", "").rstrip("/"); key = svc.get("api_key", "")
     if not base or not key:
         return {"ok": False, "error": "Service isn't configured."}
-    ver = _arr_api_ver(svc_name)
+    ver = _arr_api_ver(service_app(svc_name, svc))
     try:
         _, body = _http_request("POST", f"{base}/api/{ver}/{endpoint}/testall",
                                 headers={"X-Api-Key": key, "Content-Type": "application/json"},
@@ -1167,8 +1539,9 @@ def action_test_indexers(svc_name, svc, params):
 
 
 def _qbit_torrent_op(svc, op, hashes):
-    if not hashes:
-        return {"ok": False, "error": "No torrent specified."}
+    if not isinstance(hashes, list) or not hashes or len(hashes) > 20 or any(
+            not isinstance(h, str) or not re.fullmatch(r"[a-fA-F0-9]{40,64}", h) for h in hashes):
+        return {"ok": False, "error": "Specify valid torrent hashes."}
     try:
         base, cookie = _qbit_login(svc)
         if not cookie:
@@ -1176,7 +1549,7 @@ def _qbit_torrent_op(svc, op, hashes):
         data = urllib.parse.urlencode({"hashes": "|".join(hashes)}).encode()
         req = urllib.request.Request(f"{base}/api/v2/torrents/{op}", data=data,
                                      headers={"Referer": base, "Cookie": cookie}, method="POST")
-        with urllib.request.urlopen(req, timeout=15) as r:
+        with safe_urlopen(req, timeout=15) as r:
             ok = 200 <= r.status < 300
         verb = {"recheck": "Re-check", "reannounce": "Re-announce"}.get(op, op)
         return {"ok": ok, "message": (f"{verb} started." if ok else None),
@@ -1196,32 +1569,33 @@ def action_qbit_reannounce(svc_name, svc, params):
 
 
 def action_queue_fix(svc_name, svc, params):
-    """Remove a stuck/failed Radarr/Sonarr queue item, delete it from the client,
-    blocklist the release so it isn't grabbed again, then start a fresh search."""
-    base = svc.get("url", "").rstrip("/"); key = svc.get("api_key", "")
-    if not base or not key:
-        return {"ok": False, "error": "Service isn't configured."}
+    """Revalidate the current queue item before deletion, and report partial success."""
+    app = service_app(svc_name, svc)
+    if app not in _QUEUE_ARR:
+        return {"ok": False, "error": "This service does not support queue removal."}
     qid = params.get("queue_id")
-    if not qid:
-        return {"ok": False, "error": "No queue item specified."}
-    headers = {"X-Api-Key": key, "Content-Type": "application/json"}
+    if not isinstance(qid, int) or isinstance(qid, bool) or qid <= 0:
+        return {"ok": False, "error": "Invalid queue item."}
+    base = svc.get("url", "").rstrip("/")
+    headers = {"X-Api-Key": svc.get("api_key", ""), "Content-Type": "application/json"}
+    removed = False
     try:
+        _, body = http_get(f"{base}/api/v3/queue/{qid}", headers)
+        current = json.loads(body)
+        command, field, item_key = _QUEUE_ARR[app]
+        item_id = current.get(item_key)
+        expected = params.get("ids") or []
+        if not item_id or expected != [item_id]:
+            return {"ok": False, "error": "Queue item changed. Refresh before trying again."}
         q = urllib.parse.urlencode({"removeFromClient": "true", "blocklist": "true"})
-        _http_request("DELETE", f"{base}/api/v3/queue/{qid}?{q}", headers=headers, timeout=20)
-        search_name = params.get("search_name")
-        ids_field = params.get("ids_field")
-        ids = params.get("ids") or []
-        searched = False
-        if search_name and ids_field and ids:
-            payload = json.dumps({"name": search_name, ids_field: ids}).encode()
-            _http_request("POST", f"{base}/api/v3/command", headers=headers, data=payload, timeout=20)
-            searched = True
-        return {"ok": True, "message": "Removed and blocklisted"
-                + (", new search started." if searched else ".")}
-    except urllib.error.HTTPError as e:
-        return {"ok": False, "error": f"HTTP {e.code}: {e.reason}"}
+        _http_request("DELETE", f"{base}/api/v3/queue/{qid}?{q}", headers=headers)
+        removed = True
+        payload = json.dumps({"name": command, field: [item_id]}).encode()
+        _http_request("POST", f"{base}/api/v3/command", headers=headers, data=payload)
+        return {"ok": True, "message": "Removed and blocklisted; new search started."}
     except Exception as e:
-        return {"ok": False, "error": f"Couldn't fix the queue item: {e}"}
+        prefix = "Removed and blocklisted, but the new search failed. " if removed else "Removal failed. "
+        return {"ok": False, "partial": removed, "error": prefix + str(e)}
 
 
 # Action name -> handler. The /api/action endpoint dispatches through this.
@@ -1316,26 +1690,26 @@ def _queue_is_problem(rec):
 
 
 def _arr_blocklist_counts(base, key, id_key, item_ids):
-    """Count how many blocklisted releases each item already has, by reading the
-    *arr's own blocklist once. Best-effort: any failure just returns {} so the
-    caller falls back to the normal (non-escalated) warning. No local state."""
-    wanted = set(i for i in item_ids if i)
+    """None means the guard could not be verified; automatic deletion must stop."""
     counts = {}
+    wanted = set(i for i in item_ids if i)
     if not wanted:
         return counts
-    plural = {"episodeId": "episodeIds"}.get(id_key)   # Sonarr season packs list episodeIds
     try:
-        q = urllib.parse.urlencode({"page": 1, "pageSize": 200,
-                                    "sortKey": "date", "sortDirection": "descending"})
-        _, body = http_get(f"{base}/api/v3/blocklist?{q}", {"X-Api-Key": key}, timeout=15)
-        data = json.loads(body) if body.strip() else {}
-        for rec in (data.get("records", []) if isinstance(data, dict) else []):
-            for iid in wanted:
-                if rec.get(id_key) == iid or (plural and iid in (rec.get(plural) or [])):
-                    counts[iid] = counts.get(iid, 0) + 1
+        for page in range(1, 101):
+            q = urllib.parse.urlencode({"page": page, "pageSize": 200, "sortKey": "date", "sortDirection": "descending"})
+            _, body = http_get(f"{base}/api/v3/blocklist?{q}", {"X-Api-Key": key}, timeout=10)
+            data = json.loads(body)
+            records = data["records"]
+            for rec in records:
+                for iid in wanted:
+                    if rec.get(id_key) == iid or (id_key == "episodeId" and iid in (rec.get("episodeIds") or [])):
+                        counts[iid] = counts.get(iid, 0) + 1
+            if page * 200 >= data.get("totalRecords", len(records)):
+                return counts
+        return None
     except Exception:
-        pass
-    return counts
+        return None
 
 
 def augment_queue_issues(cfg, results):
@@ -1354,15 +1728,16 @@ def augment_queue_issues(cfg, results):
        so we lead with Force re-check / Re-announce and push remove+blocklist to a
        warned last resort."""
     # Stalled/errored qBittorrent torrents by hash, so we can correlate.
-    qbit_res = results.get("qbittorrent") or {}
     qbit_by_hash = {}
-    for qe in qbit_res.get("errors", []):
-        h = (qe.get("hash") or "").lower()
-        if h:
-            qbit_by_hash[h] = qe
+    for client, _ in active_instances(cfg, stype="qbit"):
+        for issue in results.get(client, {}).get("errors", []):
+            h = (issue.get("hash") or "").lower()
+            if h:
+                issue["service"] = client
+                qbit_by_hash.setdefault(h, []).append(issue)
     arr_seen_stalls = set()   # downloadIds currently stalling, for grace-timer pruning
 
-    for name, (search_name, ids_field, id_key) in _QUEUE_ARR.items():
+    for name, (search_name, ids_field, id_key) in queue_instances(cfg):
         svc = cfg["services"].get(name, {})
         if svc.get("disabled") or not svc.get("url") or not svc.get("api_key"):
             continue
@@ -1371,12 +1746,7 @@ def augment_queue_issues(cfg, results):
             continue
         base = svc["url"].rstrip("/"); key = svc["api_key"]
         try:
-            q = urllib.parse.urlencode({"pageSize": 200,
-                                        "includeUnknownMovieItems": "true",
-                                        "includeUnknownSeriesItems": "true"})
-            _, body = http_get(f"{base}/api/v3/queue?{q}", {"X-Api-Key": key}, timeout=15)
-            data = json.loads(body) if body.strip() else {}
-            records = data.get("records", []) if isinstance(data, dict) else []
+            records = arr_queue_records(svc)
         except Exception:
             continue
         # Collect the stuck/failed records first, then fetch the blocklist ONCE
@@ -1385,7 +1755,7 @@ def augment_queue_issues(cfg, results):
         stuck = [r for r in records if _queue_is_problem(r)]
         if not stuck:
             continue
-        blockcounts = _arr_blocklist_counts(base, key, id_key, [r.get(id_key) for r in stuck])
+        blockcounts = _arr_blocklist_counts(base, key, id_key, [r.get(id_key) for r in stuck]) or {}
         stuck_err = stuck_warn = 0
         for rec in stuck:
             tds = (rec.get("trackedDownloadStatus") or "").lower()   # ok | warning | error
@@ -1400,7 +1770,8 @@ def augment_queue_issues(cfg, results):
                     rec.get("trackedDownloadState") or status or "unknown")
             state = (rec.get("trackedDownloadState") or "").lower()
             dlid = (rec.get("downloadId") or "").lower()
-            qe = qbit_by_hash.get(dlid)                      # matching qBit torrent, if any
+            matches = qbit_by_hash.get(dlid, [])
+            qe = matches[0] if len(matches) == 1 else None                      # matching qBit torrent, if any
             qstate = ((qe.get("state") if qe else "") or "").lower()
             low = f"{detail} {state} {qstate}".lower()
 
@@ -1429,7 +1800,7 @@ def augment_queue_issues(cfg, results):
             manual = "manual import" in low
             # Proper doc link: queue/import problems are *arr-side, so point at the
             # servarr wiki rather than qBittorrent's docs.
-            doc = _ARR_WIKI.get(name, "https://wiki.servarr.com/")
+            doc = _ARR_WIKI.get(service_app(name, svc), "https://wiki.servarr.com/")
 
             # Stall grace: a transient connectivity stall still shows, but stays
             # provisional (no alert) until it's been stalled past the grace window.
@@ -1440,8 +1811,8 @@ def augment_queue_issues(cfg, results):
                          or any(w in low for w in ("stalled", "no connection", "no peers"))))
             provisional = False
             if stalling and dlid and qe is None:
-                arr_seen_stalls.add(dlid)
-                if not _stall_held(_ARR_STALL_SINCE, dlid, True):
+                arr_seen_stalls.add((name, dlid))
+                if not _stall_held(_ARR_STALL_SINCE, (name, dlid), True):
                     provisional = True
 
             # Import-scan grace: "No files found are eligible for import" is usually
@@ -1450,8 +1821,8 @@ def augment_queue_issues(cfg, results):
             # persisted past the grace window, then flag it as a real stuck import.
             if (not failed and not manual and not stalling and dlid
                     and ("eligible for import" in low or "no files found" in low)):
-                arr_seen_stalls.add(dlid)   # shares the transient grace timer + pruning
-                if not _stall_held(_ARR_STALL_SINCE, dlid, True):
+                arr_seen_stalls.add((name, dlid))   # shares the transient grace timer + pruning
+                if not _stall_held(_ARR_STALL_SINCE, (name, dlid), True):
                     continue   # within grace: don't show or flag it yet
 
             # Remove + blocklist + re-search (cause-aware confirmation text).
@@ -1473,7 +1844,7 @@ def augment_queue_issues(cfg, results):
                                 "Re-announce first, and only remove if you've already "
                                 "ruled out your client and a lack of seeds.")
                 remove_act = {"label": "Remove + blocklist + re-search", "action": "queue_fix",
-                              "destructive": True, "confirm": confirm,
+                              "destructive": True, "confirm": confirm, "service": name,
                               "params": {"queue_id": rec.get("id"), "search_name": search_name,
                                          "ids_field": ids_field, "ids": [rec.get(id_key)]}}
 
@@ -1482,9 +1853,9 @@ def augment_queue_issues(cfg, results):
             gentle = []
             if not manual and qe and dlid:
                 gentle = [{"label": "Force re-check", "action": "qbit_recheck",
-                           "destructive": False, "params": {"hashes": [dlid]}},
+                           "destructive": False, "service": qe["service"], "params": {"hashes": [dlid]}},
                           {"label": "Re-announce", "action": "qbit_reannounce",
-                           "destructive": False, "params": {"hashes": [dlid]}}]
+                           "destructive": False, "service": qe["service"], "params": {"hashes": [dlid]}}]
 
             # Order by cause: failures lead with remove; stalls lead with the gentle fixes.
             actions = []
@@ -1570,105 +1941,79 @@ def _qbit_scan_files(base, cookie, h, exts):
 
 
 def scan_blocked_files(cfg, results):
-    """Scan Radarr/Sonarr torrents for blocked file types. Flags a match as an
-    error with a remove+blocklist+re-search action; auto-removes instead when
-    malware_autoremove is on (capped by the blocklist loop guard)."""
-    svcs = cfg["services"]
-    qbit = svcs.get("qbittorrent", {})
-    if qbit.get("disabled") or not qbit.get("url") or not qbit.get("username"):
-        return   # need qBittorrent to read file lists
+    """Scan each client independently. Cache is scoped to client and current rules."""
     beta = cfg.get("beta", {})
-    exts = []
-    for e in beta.get("malware_extensions", _DEFAULT_BLOCKED_EXTS):
-        e = str(e).strip().lower().lstrip(".")
-        if e:
-            exts.append("." + e)
+    exts = tuple(sorted(set("." + str(e).strip().lower().lstrip(".")
+                            for e in beta.get("malware_extensions", _DEFAULT_BLOCKED_EXTS) if str(e).strip().lstrip("."))))
     if not exts:
         return
     autoremove = bool(beta.get("malware_autoremove"))
-    try:
-        base, cookie = _qbit_login(qbit)
-        if not cookie:
-            return
-        _, body = http_get(f"{base}/api/v2/torrents/info", auth_cookie=cookie)
-        qhashes = {(t.get("hash") or "").lower() for t in (json.loads(body) if body.strip() else [])}
-    except Exception:
-        return
-
-    seen = set()
-    for name, (search_name, ids_field, id_key) in _QUEUE_ARR.items():
-        svc = svcs.get(name, {})
-        if svc.get("disabled") or not svc.get("url") or not svc.get("api_key"):
-            continue
-        res = results.get(name)
-        if not res:
-            continue
-        base_arr = svc["url"].rstrip("/"); key = svc["api_key"]
+    live = set()
+    handled = set()
+    for client, qbit in active_instances(cfg, stype="qbit"):
         try:
-            q = urllib.parse.urlencode({"pageSize": 200, "includeUnknownMovieItems": "true",
-                                        "includeUnknownSeriesItems": "true"})
-            _, body = http_get(f"{base_arr}/api/v3/queue?{q}", {"X-Api-Key": key}, timeout=15)
-            records = (json.loads(body) if body.strip() else {}).get("records", [])
+            base, cookie = _qbit_login(qbit)
+            if not cookie:
+                continue
+            _, body = http_get(f"{base}/api/v2/torrents/info", auth_cookie=cookie)
+            hashes = {t.get("hash", "").lower() for t in json.loads(body)}
         except Exception:
             continue
-        for rec in records:
-            dlid = (rec.get("downloadId") or "").lower()
-            if not dlid or dlid not in qhashes:
-                continue   # only torrents qBittorrent actually holds
-            seen.add(dlid)
-            found = _MALWARE_SCANNED.get(dlid)
-            if found is None:
-                found = _qbit_scan_files(base, cookie, dlid, exts)
+        for name, (command, field, id_key) in queue_instances(cfg):
+            svc = cfg["services"][name]
+            if name not in results:
+                continue
+            try:
+                records = arr_queue_records(svc)
+            except Exception:
+                continue
+            for rec in records:
+                h = (rec.get("downloadId") or "").lower()
+                if h not in hashes or (name, rec.get("id")) in handled:
+                    continue
+                handled.add((name, rec.get("id")))
+                cache_key = (client, base, h, exts)
+                live.add(cache_key)
+                found = _MALWARE_SCANNED.get(cache_key)
                 if found is None:
-                    continue   # no metadata yet; try again next poll
-                _MALWARE_SCANNED[dlid] = found
-            if not found:
-                continue   # clean
-
-            title = (rec.get("title") or "Unknown release")[:80]
-            badlist = ", ".join(found[:3])
-            item_id = rec.get(id_key)
-            can_fix = bool(rec.get("id") and item_id)
-
-            # auto-remove (opt-in), but stop if we've already burned through several
-            # releases for this item, to avoid an endless remove/re-search loop
-            looping = False
-            if autoremove and can_fix:
-                cnt = _arr_blocklist_counts(base_arr, key, id_key, [item_id]).get(item_id, 0)
-                looping = cnt >= _LOOP_BLOCKLIST_THRESHOLD
-
-            if autoremove and can_fix and not looping:
-                action_queue_fix(name, svc, {"queue_id": rec.get("id"), "search_name": search_name,
-                                             "ids_field": ids_field, "ids": [item_id]})
-                _MALWARE_SCANNED.pop(dlid, None)
-                iss = _issue("warning", title,
-                             f"Blocked file type ({badlist}) found; removed, blocklisted, and searching for a clean release."[:300], "")
-            else:
-                msg = f"Blocked file type in download: {badlist}. Likely a fake or malware release."
-                if looping:
-                    msg += " Auto-remove paused after repeated bad releases; remove manually if you're sure."
-                iss = _issue("error", title, msg[:300], "")
+                    found = _qbit_scan_files(base, cookie, h, exts)
+                    if found is None:
+                        continue
+                    _MALWARE_SCANNED[cache_key] = found
+                if not found:
+                    continue
+                item = rec.get(id_key)
+                params = {"queue_id": rec.get("id"), "ids": [item], "search_name": command, "ids_field": field}
+                msg = "Blocked file type in download: " + ", ".join(found[:3])
+                level = "error"
+                can_fix = bool(item and rec.get("id"))
+                if autoremove and can_fix:
+                    counts = _arr_blocklist_counts(svc["url"].rstrip("/"), svc["api_key"], id_key, [item])
+                    if counts is None:
+                        msg += ". Auto-remove paused: cannot verify the blocklist safety limit."
+                    elif counts.get(item, 0) >= _LOOP_BLOCKLIST_THRESHOLD:
+                        msg += ". Auto-remove paused after repeated bad releases."
+                    else:
+                        result = execute_action(cfg, name, "queue_fix", params, automatic=True)
+                        msg += ". " + (result.get("message") if result.get("ok") else result.get("error", "Removal failed."))
+                        if result.get("ok"):
+                            level = "warning"
+                            can_fix = False
+                        elif result.get("partial"):
+                            can_fix = False
+                issue = _issue(level, (rec.get("title") or "Download")[:80], msg[:500])
+                issue.update(id=_issue_id(name, issue), service=name)
                 if can_fix:
-                    iss["actions"] = [{
-                        "label": "Remove + blocklist + re-search", "action": "queue_fix", "destructive": True,
-                        "confirm": (f"This download contains a blocked file type ({badlist}), which usually "
-                                    "means a fake or malware release. Remove it, blocklist it, and search "
-                                    "for a clean one?"),
-                        "params": {"queue_id": rec.get("id"), "search_name": search_name,
-                                   "ids_field": ids_field, "ids": [item_id]},
-                    }]
-            iss["id"] = _issue_id(name, iss)
-            iss["service"] = name
-            res.setdefault("errors", []).append(iss)
-            lvl = iss["level"]
-            if lvl == "error" and res.get("level") != "error":
-                res["level"] = "error"
-            elif lvl == "warning" and res.get("level") == "ok":
-                res["level"] = "warning"
-
-    for h in list(_MALWARE_SCANNED):   # forget torrents that are gone
-        if h not in seen:
-            del _MALWARE_SCANNED[h]
+                    issue["actions"] = [{"label": "Remove + blocklist + re-search", "action": "queue_fix",
+                                         "service": name, "destructive": True, "params": params,
+                                         "confirm": "Delete this download, blocklist it, and start a new search?"}]
+                res = results[name]
+                res.setdefault("errors", []).append(issue)
+                if level == "error" or res.get("level") == "ok":
+                    res["level"] = level
+    for key in list(_MALWARE_SCANNED):
+        if key not in live:
+            _MALWARE_SCANNED.pop(key, None)
 
 
 # ----------------------------------------------------------------------------
@@ -1833,10 +2178,10 @@ def _fetch_bytes(url, headers=None, timeout=12):
     """Fetch raw bytes + content-type. Returns (bytes, content_type) or (None, None)."""
     try:
         req = urllib.request.Request(url, headers=headers or {})
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            ct = r.headers.get("Content-Type", "image/jpeg")
-            data = r.read()
-            if data and ct.startswith("image"):
+        with safe_urlopen(req, timeout=timeout) as r:
+            ct = r.headers.get("Content-Type", "").split(";", 1)[0].lower()
+            data = r.read(5 * 1024 * 1024 + 1)
+            if data and len(data) <= 5 * 1024 * 1024 and ct in ("image/jpeg", "image/png", "image/webp", "image/gif", "image/avif"):
                 return data, ct
     except Exception:
         pass
@@ -1864,17 +2209,14 @@ def _arr_poster_url(cfg, kind, title, year=""):
 
 
 def _combined_now_playing(cfg):
-    """The unified now-playing stream list, in the same stable order get_stats
-    uses (Plex first, then Jellyfin). Centralized so /api/poster indexes into
-    exactly the same list the dashboard shows."""
-    svcs = cfg["services"]
     streams = []
-    if not svcs.get("plex", {}).get("disabled"):
-        ps = _plex_sessions(svcs.get("plex", {}))
-        if ps: streams.extend(ps.get("streams", []))
-    if not svcs.get("jellyfin", {}).get("disabled"):
-        js = _jellyfin_sessions(svcs.get("jellyfin", {}))
-        if js: streams.extend(js.get("streams", []))
+    for name, svc in active_instances(cfg):
+        fetcher = {"plex": _plex_sessions, "jellyfin": _jellyfin_sessions}.get(svc.get("type"))
+        if fetcher:
+            sessions = fetcher(svc) or {}
+            for row in sessions.get("streams", []):
+                row.update(instance=name, source=svc.get("label", name))
+                streams.append(row)
     return streams
 
 
@@ -1884,17 +2226,17 @@ def get_poster(cfg, idx):
     token), then falls back to a Radarr/Sonarr poster lookup by title. Jellyfin
     streams have no thumb, so they go straight to the arr fallback.
     Returns (bytes, content_type) or (None, None)."""
-    streams = _combined_now_playing(cfg)
-    if idx >= len(streams):
+    streams = get_stats(cfg).get("now_playing", {}).get("streams", [])
+    if idx < 0 or idx >= len(streams):
         return None, None
     s = streams[idx]
 
     # 1) Plex thumbnail (only Plex streams carry one), proxied server-side so the
     # token never reaches the browser
     thumb = s.get("thumb")
-    plex = cfg["services"].get("plex", {})
+    plex = cfg["services"].get(s.get("instance", "plex"), {})
     token = plex.get("token", "")
-    if thumb and token and s.get("source") == "Plex":
+    if thumb and token and plex.get("type") == "plex":
         base = plex["url"].rstrip("/")
         url = f"{base}{thumb}{'&' if '?' in thumb else '?'}X-Plex-Token={urllib.parse.quote(token)}"
         data, ct = _fetch_bytes(url)
@@ -1922,32 +2264,22 @@ def _record_stream_count(n):
 
 
 def uptime_percentages():
-    """30-day uptime % per service, derived from the history log."""
-    events = _prune_history(load_history())
-    # crude but reasonable: % of logged transitions that are 'recover' vs 'down'
-    # better: time-weighted, but keep it light. Use down-count to estimate.
-    now = datetime.now().timestamp()
-    span = 30 * 86400
-    per = {}
-    # build down intervals per service
-    by_svc = {}
-    for e in events:
-        by_svc.setdefault(e["service"], []).append(e)
-    for svc, evs in by_svc.items():
-        evs.sort(key=lambda e: e["ts"])
-        downtime = 0.0
-        down_since = None
-        for e in evs:
-            if e["kind"] == "down" and down_since is None:
-                down_since = e["ts"]
-            elif e["kind"] == "recover" and down_since is not None:
-                downtime += e["ts"] - down_since
-                down_since = None
-        if down_since is not None:
-            downtime += now - down_since
-        pct = max(0.0, min(100.0, (1 - downtime / span) * 100))
-        per[svc] = round(pct, 2)
-    return per
+    """Time-weighted health during observed periods; offline monitor time is unknown."""
+    now = time.time()
+    cutoff = now - 30 * 86400
+    with OBSERVATION_LOCK:
+        data = _read_json(OBSERVATION_FILE, {})
+    out = {}
+    for name, periods in data.items():
+        observed = good = 0.0
+        for start, end, healthy in periods:
+            duration = max(0, min(now, end) - max(cutoff, start))
+            observed += duration
+            if healthy:
+                good += duration
+        if observed:
+            out[name] = round(100 * good / observed, 2)
+    return out
 
 
 def _jellyfin_library_counts(svc):
@@ -2023,160 +2355,54 @@ def get_stats(cfg):
 
 
 def _compute_stats(cfg):
-    svcs = cfg["services"]
-    out = {"ok": True}
-
-    # Lite stats mode (beta): serve only the data we already have locally: the
-    # 30-day uptime/downtime figures (from history.json) and the in-memory stream
-    # graph, and skip every upstream fan-out (library counts, now-playing,
-    # storage). This caps the server cost of an open dashboard. It touches ONLY
-    # the stats panel: health checks, warnings/errors, history and notifications
-    # all run in the poll loop and are completely unaffected.
+    out = {"ok": True, "uptime": uptime_percentages()}
     if cfg.get("beta", {}).get("lite_stats"):
         out["lite"] = True
-        out["uptime"] = uptime_percentages()
-        # No stream history in lite mode: nothing records stream counts while it's
-        # on, so the "streams · last 24h" graph would just show stale data. Omit it
-        # so the frontend hides the graph entirely.
         return out
-
-    plex_svc = svcs.get("plex", {})
-    jelly_svc = svcs.get("jellyfin", {})
-    radarr_svc = svcs.get("radarr", {})
-    sonarr_svc = svcs.get("sonarr", {})
-
-    radarr_on = not radarr_svc.get("disabled")
-    sonarr_on = not sonarr_svc.get("disabled")
-    # Media servers expose cheap library totals (Plex via totalSize headers,
-    # Jellyfin via /Items/Counts), so prefer them for the headline movie/episode
-    # counts. The traditional *arr count fetches the WHOLE /movie and /series
-    # arrays just to measure length, so we only fall back to it when neither
-    # media server is configured to answer.
-    plex_active = bool((not plex_svc.get("disabled")) and plex_svc.get("token"))
-    jelly_active = bool((not jelly_svc.get("disabled")) and jelly_svc.get("api_key"))
-    have_media_server = plex_active or jelly_active
-    both_servers = plex_active and jelly_active
-
-    # Fan out every independent network call at once. Each underlying helper
-    # already swallows its own errors (returns None/[] on failure), so a single
-    # slow or unreachable service degrades to an empty panel rather than blocking
-    # or crashing the whole stats response.
     tasks = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as ex:
-        # headline library counts: cheap media-server totals when available,
-        # otherwise (and only otherwise) the expensive full-array *arr grab.
-        if plex_active:
-            tasks["plex_lib"] = ex.submit(_plex_library_counts, plex_svc)
-        if jelly_active:
-            tasks["jelly_lib"] = ex.submit(_jellyfin_library_counts, jelly_svc)
-        if not have_media_server:
-            if radarr_on:
-                tasks["arr_movies"] = ex.submit(_arr_count, radarr_svc, "movie")
-            if sonarr_on:
-                tasks["arr_episodes"] = ex.submit(_arr_count, sonarr_svc, "series")
-        # storage still comes from the *arr diskspace endpoint regardless
-        if radarr_on:
-            tasks["radarr_disk"] = ex.submit(_arr_diskspace, radarr_svc)
-        if sonarr_on:
-            tasks["sonarr_disk"] = ex.submit(_arr_diskspace, sonarr_svc)
-        tasks["torrents"] = ex.submit(get_torrents, cfg)
-        # now-playing: gate on disabled only (matches _combined_now_playing, which
-        # /api/poster indexes into, so keep this in lockstep so poster indices line up)
-        if not plex_svc.get("disabled"):
-            tasks["plex_np"] = ex.submit(_plex_sessions, plex_svc)
-        if not jelly_svc.get("disabled"):
-            tasks["jelly_np"] = ex.submit(_jellyfin_sessions, jelly_svc)
-        # disk-based (no network) but cheap to run alongside the rest
-        tasks["uptime"] = ex.submit(uptime_percentages)
-
-    def _res(key, default=None):
-        f = tasks.get(key)
-        if f is None:
-            return default
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        tasks[("streams", "")] = pool.submit(_combined_now_playing, cfg)
+        tasks[("downloads", "")] = pool.submit(get_torrents, cfg)
+        for name, svc in active_instances(cfg):
+            if svc.get("type") in ("plex", "jellyfin"):
+                fn = _plex_library_counts if svc["type"] == "plex" else _jellyfin_library_counts
+                tasks[("library", name)] = pool.submit(fn, svc)
+            if service_app(name, svc) in ("radarr", "sonarr"):
+                tasks[("disk", name)] = pool.submit(_arr_diskspace, svc)
+    libraries, drives, streams = [], [], []
+    for (kind, name), future in tasks.items():
         try:
-            return f.result()
+            data = future.result()
         except Exception:
-            return default
-
-    # ---- headline movie / episode totals ----
-    pc = _res("plex_lib")
-    jc = _res("jelly_lib")
-    if pc is not None or jc is not None:
-        # Plex and Jellyfin almost always mirror the same underlying library, so
-        # the larger of the two IS the true total, so take the max per metric
-        # rather than summing, which would double-count shared titles. (e.g. Plex
-        # 257 / Jellyfin 248 movies -> 257, not 505.)
-        def _bigger(metric):
-            vals = [c.get(metric) for c in (pc, jc)
-                    if isinstance(c, dict) and c.get(metric) is not None]
-            return max(vals) if vals else None
-        m, e = _bigger("movies"), _bigger("episodes")
-        if m is not None: out["movies"] = m
-        if e is not None: out["episodes"] = e
-    else:
-        # no media server configured -> fall back to the *arr counts (canonical
-        # "what you own"). Key present (possibly None) whenever the app is on.
-        if "arr_movies" in tasks:
-            out["movies"] = _res("arr_movies")
-        if "arr_episodes" in tasks:
-            out["episodes"] = _res("arr_episodes")
-
-    # When BOTH media servers are active, also break the library out per server
-    # so the dashboard can show each one next to the (max) headline total.
-    if both_servers:
-        per_server = []
-        if pc is not None: per_server.append({"server": "Plex", **pc})
-        if jc is not None: per_server.append({"server": "Jellyfin", **jc})
-        if per_server:
-            out["library_by_server"] = per_server
-
-    t = _res("torrents")
-    if isinstance(t, dict) and t.get("ok"):
-        out["torrents"] = len(t.get("downloading", [])) + len(t.get("seeding", []))
-
-    # per-drive storage: merge diskspace from radarr+sonarr, dedupe by path
-    # (radarr first, so its entry wins on a shared path; order preserved)
-    drives = {}
-    for key in ("radarr_disk", "sonarr_disk"):
-        for d in (_res(key) or []):
-            dkey = d["path"] or d["label"]
-            if dkey not in drives:
-                drives[dkey] = d
-    out["drives"] = sorted(drives.values(), key=lambda d: d["pct"], reverse=True)
-
-    # plex / jellyfin now-playing. Build ONE combined stream list from every
-    # enabled media server (capability "stats") so the view works with Plex,
-    # Jellyfin, both, or neither. Keep this order stable (Plex first, then
-    # Jellyfin) to match the list /api/poster indexes into.
-    np_sources = []   # (label, sessions-dict)
-    ps = _res("plex_np")
-    if ps is not None:
-        np_sources.append(("Plex", ps))
-    js = _res("jelly_np")
-    if js is not None:
-        np_sources.append(("Jellyfin", js))
-
-    if np_sources:
-        combined = []
-        for _, sess in np_sources:
-            combined.extend(sess.get("streams", []))
-        transcoding = sum(1 for s in combined if s.get("mode") == "transcode")
-        out["now_playing"] = {
-            "count": len(combined),
-            "streams": combined,
-            "transcoding": transcoding,
-            "direct": len(combined) - transcoding,
-            # which servers contributed, so the UI can label a combined view
-            "sources": [label for label, _ in np_sources],
-        }
-        _record_stream_count(len(combined))
-        # keep the old single-source "plex" key populated when Plex is the only
-        # source, so nothing that still reads it breaks.
-        if [l for l, _ in np_sources] == ["Plex"]:
-            out["plex"] = np_sources[0][1]
-
-    # uptime % + stream history graph
-    out["uptime"] = _res("uptime") or {}
+            continue
+        if kind == "library" and data:
+            libraries.append(dict(server=cfg["services"][name].get("label", name), **data))
+        elif kind == "disk":
+            for row in data or []:
+                row = dict(row)
+                row["label"] = cfg["services"][name].get("label", name) + ": " + row.get("label", "Storage")
+                drives.append(row)
+        elif kind == "streams":
+            streams = data or []
+        elif kind == "downloads" and data:
+            out["torrents"] = len(data.get("downloading", [])) + len(data.get("seeding", []))
+    out["library_by_server"] = libraries
+    # Overlapping libraries cannot be deduplicated from counts; retain a clearly labeled estimate.
+    for metric in ("movies", "episodes"):
+        values = [r[metric] for r in libraries if isinstance(r.get(metric), (int, float))]
+        if values:
+            out[metric] = max(values)
+    if not libraries:
+        for app, kind, metric in (("radarr", "movie", "movies"), ("sonarr", "series", "episodes")):
+            values = [_arr_count(svc, kind) for _, svc in active_instances(cfg, (app,))]
+            values = [v for v in values if isinstance(v, (int, float))]
+            if values:
+                out[metric] = max(values)
+    out["drives"] = drives
+    transcoding = sum(s.get("mode") == "transcode" for s in streams)
+    out["now_playing"] = {"streams": streams, "count": len(streams), "transcoding": transcoding,
+                          "direct": len(streams)-transcoding, "sources": list(dict.fromkeys(s.get("source") for s in streams))}
+    _record_stream_count(len(streams))
     out["stream_history"] = [n for _, n in _STREAM_HISTORY][-48:]
     return out
 
@@ -2210,12 +2436,15 @@ def _parse_version(v):
 
 
 def _is_newer(remote, local):
-    r, l = _parse_version(remote), _parse_version(local)
+    r, l = _parse_version(str(remote).split("-", 1)[0]), _parse_version(str(local).split("-", 1)[0])
     # pad to equal length
     n = max(len(r), len(l))
     r = r + (0,) * (n - len(r))
     l = l + (0,) * (n - len(l))
-    return r > l
+    if r != l:
+        return r > l
+    # A stable release supersedes its release candidate with the same numbers.
+    return "-" not in str(remote) and "-" in str(local)
 
 
 def check_for_update(force=False):
@@ -2231,7 +2460,7 @@ def check_for_update(force=False):
             "Accept": "application/vnd.github+json",
             "User-Agent": "GuardTowarr",
         })
-        with urllib.request.urlopen(req, timeout=10) as r:
+        with safe_urlopen(req, timeout=10) as r:
             rel = json.loads(r.read().decode("utf-8"))
         # ignore drafts / prereleases
         if not rel.get("draft") and not rel.get("prerelease"):
@@ -2301,8 +2530,7 @@ def save_dismissed(d):
     global _DISMISSED
     with DISMISS_LOCK:
         _DISMISSED = dict(d)   # keep the cache in lockstep with what's on disk
-        with open(DISMISS_FILE, "w") as f:
-            json.dump(d, f, indent=2)
+        atomic_json(DISMISS_FILE, d)
 
 
 def dismiss_issue(issue_id, meta):
@@ -2350,8 +2578,18 @@ def load_history():
 
 
 def _prune_history(events):
-    cutoff = (datetime.now() - timedelta(days=HISTORY_RETENTION_DAYS)).timestamp()
-    return [e for e in events if e.get("ts", 0) >= cutoff]
+    cutoff = time.time() - HISTORY_RETENTION_DAYS * 86400
+    if not isinstance(events, list):
+        return []
+    recent, anchors = [], {}
+    for e in events:
+        if not isinstance(e, dict) or not isinstance(e.get("ts"), (int, float)):
+            continue
+        if e["ts"] >= cutoff:
+            recent.append(e)
+        elif e.get("service") and e["ts"] > anchors.get(e["service"], {}).get("ts", 0):
+            anchors[e["service"]] = e
+    return sorted(list(anchors.values()) + recent, key=lambda e: e["ts"])
 
 
 def log_history(service, kind, level, summary):
@@ -2366,8 +2604,7 @@ def log_history(service, kind, level, summary):
             "level": level,
             "summary": summary,
         })
-        with open(HISTORY_FILE, "w") as f:
-            json.dump(events, f, indent=2)
+        atomic_json(HISTORY_FILE, events)
 
 
 def history_summary():
@@ -2449,7 +2686,7 @@ def send_ntfy(cfg_notif, title, message, priority="default", tags=""):
             req.add_header("Priority", priority)
         if tags:
             req.add_header("Tags", tags)
-        with urllib.request.urlopen(req, timeout=10) as r:
+        with safe_urlopen(req, timeout=10) as r:
             return (r.status in (200, 201)), None
     except Exception as e:
         return False, str(e)
@@ -2482,7 +2719,7 @@ def send_discord(cfg_notif, title, message, level="info", fix_url=""):
         req.add_header("Content-Type", "application/json")
         # Discord rejects requests without a User-Agent; urllib's default is often blocked.
         req.add_header("User-Agent", "GuardTowarr (https://github.com/tonytrawl/GuardTowarr)")
-        with urllib.request.urlopen(req, timeout=10) as r:
+        with safe_urlopen(req, timeout=10) as r:
             ok = 200 <= r.status < 300
             if not ok:
                 print(f"[discord] unexpected status {r.status}")
@@ -2532,7 +2769,7 @@ def send_pushover(cfg_notif, title, message, level="info", fix_url=""):
         req = urllib.request.Request("https://api.pushover.net/1/messages.json",
                                      data=data, method="POST")
         req.add_header("Content-Type", "application/x-www-form-urlencoded")
-        with urllib.request.urlopen(req, timeout=10) as r:
+        with safe_urlopen(req, timeout=10) as r:
             body = r.read().decode("utf-8", "replace")
             try:
                 ok = json.loads(body).get("status") == 1
@@ -2555,9 +2792,50 @@ def send_pushover(cfg_notif, title, message, level="info", fix_url=""):
         return False, str(e)
 
 
+def send_telegram(cfg_notif, title, message, level="info", fix_url=""):
+    """Fire a single Telegram message via the Bot API. The user makes a bot with
+    @BotFather (which gives a token) and supplies the chat id to deliver to. Sent
+    as plain text (Telegram auto-links bare URLs) so message contents can't break
+    Markdown parsing. Returns (ok, error)."""
+    token = (cfg_notif.get("telegram_token") or "").strip()
+    chat = (cfg_notif.get("telegram_chat") or "").strip()
+    if not token or not chat:
+        return False, "Telegram bot token or chat id not set."
+    icon = {"error": "🔴", "warning": "🟡", "ok": "🟢", "info": "🔔"}.get(level, "🔔")
+    text = f"{icon} {title}\n\n{message}"
+    if fix_url:
+        text += f"\n\nFix: {fix_url}"
+    params = {"chat_id": chat, "text": text, "disable_web_page_preview": "true"}
+    try:
+        data = urllib.parse.urlencode(params).encode("utf-8")
+        req = urllib.request.Request(f"https://api.telegram.org/bot{token}/sendMessage",
+                                     data=data, method="POST")
+        req.add_header("Content-Type", "application/x-www-form-urlencoded")
+        with safe_urlopen(req, timeout=10) as r:
+            body = r.read().decode("utf-8", "replace")
+            try:
+                ok = json.loads(body).get("ok") is True
+            except Exception:
+                ok = 200 <= r.status < 300
+            return ok, (None if ok else "Telegram rejected the message.")
+    except urllib.error.HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode("utf-8")[:300]
+        except Exception:
+            pass
+        msg = f"HTTP {e.code} from Telegram: {body or e.reason}"
+        print(f"[telegram] {msg}")
+        return False, msg
+    except Exception as e:
+        print(f"[telegram] send failed: {e}")
+        return False, str(e)
+
+
 def send_alert(notif, title, message, priority="default", tags="", level="info", fix_url=""):
-    """Fan out a single alert to every enabled channel (ntfy, Discord, Pushover).
-    Returns (ok, error) where ok is True if at least one channel accepted it."""
+    """Fan out a single alert to every enabled channel (ntfy, Discord, Pushover,
+    Telegram). Returns (ok, error) where ok is True if at least one channel
+    accepted it."""
     results = []
     # ntfy: opt-in flag (default on) plus a topic
     if notif.get("ntfy_enabled", True) and (notif.get("topic") or "").strip():
@@ -2569,6 +2847,9 @@ def send_alert(notif, title, message, priority="default", tags="", level="info",
     # Pushover: opt-in, needs both an app token and a user key
     if notif.get("pushover_enabled") and (notif.get("pushover_token") or "").strip() and (notif.get("pushover_user") or "").strip():
         results.append(send_pushover(notif, title, message, level=level, fix_url=fix_url))
+    # Telegram: opt-in, needs both a bot token and a chat id
+    if notif.get("telegram_enabled") and (notif.get("telegram_token") or "").strip() and (notif.get("telegram_chat") or "").strip():
+        results.append(send_telegram(notif, title, message, level=level, fix_url=fix_url))
     if not results:
         return False, "No notification channel configured."
     ok = any(r[0] for r in results)
@@ -2577,11 +2858,12 @@ def send_alert(notif, title, message, priority="default", tags="", level="info",
 
 
 def any_channel_ready(notif):
-    """True if at least one delivery channel is configured (ntfy topic, Discord webhook, or Pushover keys)."""
+    """True if at least one delivery channel is configured (ntfy topic, Discord webhook, Pushover keys, or Telegram bot)."""
     has_ntfy = bool(notif.get("ntfy_enabled", True) and (notif.get("topic") or "").strip())
     has_discord = bool(notif.get("discord_enabled") and (notif.get("discord_webhook") or "").strip())
     has_pushover = bool(notif.get("pushover_enabled") and (notif.get("pushover_token") or "").strip() and (notif.get("pushover_user") or "").strip())
-    return has_ntfy or has_discord or has_pushover
+    has_telegram = bool(notif.get("telegram_enabled") and (notif.get("telegram_token") or "").strip() and (notif.get("telegram_chat") or "").strip())
+    return has_ntfy or has_discord or has_pushover or has_telegram
 
 
 def effective_level(name, res, dismissed):
@@ -2661,83 +2943,46 @@ _TORRENT_DONE_SEEDED = False  # don't fire for everything already-complete on fi
 
 
 def _arr_queue_titles(cfg):
-    """Map a download name -> clean 'Title (year)' using the Radarr/Sonarr queues.
-    Cheap: only called when a torrent actually completes."""
     titles = {}
-    for sname, kind in (("radarr", "movie"), ("sonarr", "series")):
-        svc = cfg["services"].get(sname, {})
-        if svc.get("disabled") or not svc.get("url") or not svc.get("api_key"):
-            continue
-        base = svc["url"].rstrip("/"); key = svc["api_key"]
+    for name, svc in active_instances(cfg, ("radarr", "sonarr")):
         try:
-            q = urllib.parse.urlencode({"pageSize": 200})
-            _, body = http_get(f"{base}/api/v3/queue?{q}", {"X-Api-Key": key}, timeout=12)
-            data = json.loads(body) if body.strip() else {}
-            for r in data.get("records", []):
-                dl = (r.get("downloadId") or "").lower()       # qBittorrent hash
-                title = r.get("title", "")
-                if dl and title:
-                    titles[dl] = title
+            for row in arr_queue_records(svc):
+                titles[str(row.get("downloadId", "")).lower()] = row.get("title", "")
         except Exception:
             continue
     return titles
 
 
 def check_torrent_completions(cfg):
-    """Detect torrents that just finished downloading and notify (respecting quiet hours)."""
-    global _TORRENT_DONE_SEEDED
     notif = cfg.get("notifications", {})
-    if not notif.get("enabled") or not notif.get("torrent_done"):
+    if not notif.get("enabled") or not notif.get("torrent_done") or not any_channel_ready(notif):
         return
-    if not any_channel_ready(notif):
-        return
-    qbit = cfg["services"].get("qbittorrent", {})
-    if qbit.get("disabled") or not qbit.get("url") or not qbit.get("username"):
-        return
-
-    try:
-        base, cookie = _qbit_login(qbit)
-        _, body = http_get(f"{base}/api/v2/torrents/info", auth_cookie=cookie)
-        torrents = json.loads(body) if body.strip() else []
-    except Exception:
-        return
-
-    newly_done = []
-    seen = set()
-    for t in torrents:
-        h = t.get("hash", "")
-        if not h:
+    for name, svc in active_instances(cfg, stype="qbit"):
+        try:
+            base, cookie = _qbit_login(svc)
+            _, body = http_get(base + "/api/v2/torrents/info", auth_cookie=cookie)
+            torrents = json.loads(body)
+        except Exception:
             continue
-        seen.add(h)
-        done = (t.get("progress", 0) or 0) >= 1.0
-        was = _TORRENT_DONE_STATE.get(h)
-        _TORRENT_DONE_STATE[h] = done
-        # fire only on a transition from not-done to done (skip the first seed pass)
-        if done and was is False:
-            newly_done.append(t)
-    # drop torrents that disappeared
-    for h in list(_TORRENT_DONE_STATE.keys()):
-        if h not in seen:
-            del _TORRENT_DONE_STATE[h]
-
-    if not _TORRENT_DONE_SEEDED:
-        _TORRENT_DONE_SEEDED = True
-        return  # first run just establishes the baseline; don't alert on existing torrents
-
-    if not newly_done:
-        return
-
-    # look up clean titles only when something actually finished
-    titles = _arr_queue_titles(cfg) if newly_done else {}
-    quiet = in_quiet_hours(notif)
-    for t in newly_done:
-        h = t.get("hash", "").lower()
-        clean = titles.get(h) or t.get("name", "Download")
-        msg = f"{clean} finished downloading"
-        if quiet:
-            _QUIET_QUEUE.append({"service": "qbittorrent", "kind": "torrent", "summary": msg})
-        else:
-            send_alert(notif, "Download complete", msg, priority="default", tags="white_check_mark", level="ok")
+        seen, completed = set(), []
+        for row in torrents:
+            key = (name, row.get("hash", ""))
+            seen.add(key)
+            done = (row.get("progress", 0) or 0) >= 1
+            if done and _TORRENT_DONE_STATE.get(key) is False:
+                completed.append(row)
+            _TORRENT_DONE_STATE[key] = done
+        for key in list(_TORRENT_DONE_STATE):
+            if isinstance(key, tuple) and key[0] == name and key not in seen:
+                _TORRENT_DONE_STATE.pop(key, None)
+        titles = _arr_queue_titles(cfg) if completed else {}
+        for row in completed:
+            title = titles.get(row.get("hash", "").lower()) or row.get("name", "Download")
+            message = f"{title} finished downloading ({svc.get('label', name)})"
+            if in_quiet_hours(notif):
+                _QUIET_QUEUE.append({"service": name, "kind": "torrent", "summary": message})
+            else:
+                send_alert(notif, "Download complete", message, level="ok")
 
 
 def _fmt_duration(secs):
@@ -2913,56 +3158,90 @@ def maybe_notify(results):
         _send_startup_summary(notif, results, dismissed, threshold, ignore)
 
 
+# Dependency rules: a downstream issue (matched by substrings) is explained by one
+# of the listed root services being down. When a root is down, the *arr apps light
+# up with the same complaint, so we tag the downstream copy and stop it alerting --
+# the root's own alert covers the whole group.
+_DEP_RULES = [
+    (("indexer",), ("prowlarr",)),
+    (("download client", "downloadclient"), ("qbittorrent", "sabnzbd", "nzbget")),
+]
+# Only the media *arr apps have these downstream dependencies.
+_DEP_DOWNSTREAM = {"radarr", "sonarr", "readarr", "lidarr"}
+_DEP_LABELS = {"prowlarr": "Prowlarr", "qbittorrent": "qBittorrent",
+               "sabnzbd": "SABnzbd", "nzbget": "NZBGet"}
+
+
+def apply_dependency_context(cfg, results):
+    if not cfg.get("notifications", {}).get("dependency_aware", True):
+        return
+    for patterns, roots in _DEP_RULES:
+        candidates = [(n, s) for n, s in active_instances(cfg, roots)]
+        down = [n for n, _ in candidates if results.get(n, {}).get("level") == "error"]
+        if len(candidates) != 1 or not down:
+            continue
+        root = down[0]
+        for name, svc in active_instances(cfg, _DEP_DOWNSTREAM):
+            for issue in results.get(name, {}).get("errors", []):
+                blob = f"{issue.get('source', '')} {issue.get('message', '')}".lower()
+                if any(p in blob for p in patterns):
+                    issue["caused_by"] = root
+                    issue["provisional"] = True
+                    issue["message"] += f" (likely caused by {cfg['services'][root].get('label', root)} being down)"
+
+
 def run_poll_once():
     cfg = get_config()
+    started = time.time()
     results = {}
-    for name, svc in cfg["services"].items():
-        # skip services the user turned off (disabled) entirely
-        if svc.get("disabled", False):
-            continue
-        # skip services not enabled for monitoring
-        if not svc.get("enabled", True):
-            continue
-        checker = CHECKERS.get(svc.get("type"))
-        if not checker:
-            continue
-        try:
-            results[name] = checker(name, svc)
-        except Exception as e:
-            results[name] = svc_result(name, "error", f"Check crashed: {e}", [])
-    # Stuck-queue detection is part of the remediation feature: only scan the
-    # *arr queues when it's enabled, so turning it off removes the extra calls.
-    if cfg.get("beta", {}).get("remediation", True):
-        try:
-            augment_queue_issues(cfg, results)
-        except Exception as e:
-            print(f"[queue] error: {e}")
-    # Blocked-file scan (beta): flag/auto-remove arr torrents carrying risky file types.
-    if cfg.get("beta", {}).get("malware_scan"):
-        try:
-            scan_blocked_files(cfg, results)
-        except Exception as e:
-            print(f"[scan] error: {e}")
     with STATE_LOCK:
-        STATE["services"] = results
-        STATE["last_poll"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    try:
-        maybe_notify(results)
-    except Exception as e:
-        print(f"[notify] error: {e}")
-    try:
-        check_torrent_completions(cfg)
-    except Exception as e:
-        print(f"[torrent-notify] error: {e}")
-    print(f"[{STATE['last_poll']}] polled {len(results)} services")
+        STATE["polling"] = True
+    def check(name, svc):
+        try:
+            checker = CHECKERS.get(svc.get("type"))
+            if not checker:
+                return svc_result(name, "warning", "Unsupported service type", [])
+            result = checker(name, svc)
+            result["checked_at"] = time.time()
+            return result
+        except Exception as e:
+            return svc_result(name, "error", f"Check failed: {e}", [])
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        jobs = {pool.submit(check, n, s): n for n, s in active_instances(cfg)}
+        for future in concurrent.futures.as_completed(jobs):
+            results[jobs[future]] = future.result()
+            with STATE_LOCK:
+                STATE["services"][jobs[future]] = copy.deepcopy(results[jobs[future]])
+    for enabled, fn in ((cfg.get("beta", {}).get("remediation", True), augment_queue_issues),
+                        (cfg.get("beta", {}).get("malware_scan"), scan_blocked_files)):
+        if enabled:
+            try:
+                fn(cfg, results)
+            except Exception as e:
+                print(f"[diagnostics] {e}")
+    apply_dependency_context(cfg, results)
+    record_observations(results, cfg.get("poll_interval", 30))
+    with STATE_LOCK:
+        STATE.update(services=results, last_poll=datetime.now().isoformat(timespec="seconds"),
+                     last_poll_epoch=time.time(), poll_duration=round(time.time()-started, 2), polling=False)
+    for fn in (maybe_notify,):
+        try:
+            fn(results)
+        except Exception as e:
+            print(f"[notifications] {e}")
+    check_torrent_completions(cfg)
 
 
 def poll_loop():
     while True:
-        run_poll_once()
-        interval = get_config().get("poll_interval", POLL_INTERVAL)
-        # wake early if a manual refresh is requested
-        if REFRESH_NOW.wait(timeout=max(5, interval)):
+        try:
+            run_poll_once()
+        except Exception as e:
+            with STATE_LOCK:
+                STATE["polling"] = False
+                STATE["poll_error"] = "Monitoring cycle failed; retrying."
+            print(f"[poll] {e}")
+        if REFRESH_NOW.wait(timeout=max(5, get_config().get("poll_interval", 30))):
             REFRESH_NOW.clear()
 
 
@@ -2970,6 +3249,10 @@ def poll_loop():
 # WEB SERVER
 # ----------------------------------------------------------------------------
 class Handler(http.server.BaseHTTPRequestHandler):
+
+    def setup(self):
+        super().setup()
+        self.connection.settimeout(20)
 
     # Endpoints the restricted public port is allowed to serve (everything else
     # is 404'd there). Admin/credential/destructive routes are deliberately absent.
@@ -2980,21 +3263,29 @@ class Handler(http.server.BaseHTTPRequestHandler):
         pass  # quiet
 
     def _json(self, obj, code=200):
+        if self._is_public():
+            obj = public_payload(obj, get_config())
         payload = json.dumps(obj).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
-        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
         self.wfile.write(payload)
 
     def _read_body(self):
         length = int(self.headers.get("Content-Length", 0))
+        if length < 0 or length > 1024 * 1024:
+            raise ValueError("Request body is too large.")
         if not length:
             return {}
         try:
-            return json.loads(self.rfile.read(length).decode())
+            body = json.loads(self.rfile.read(length).decode())
+            if not isinstance(body, dict):
+                raise ValueError("Expected a JSON object.")
+            return body
         except Exception:
-            return {}
+            raise ValueError("Invalid JSON object.")
 
     # ---- public-port gating -------------------------------------------------
     def _is_public(self):
@@ -3012,7 +3303,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 supplied = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get("t", [""])[0]
             except Exception:
                 supplied = ""
-        return bool(supplied) and hmac.compare_digest(str(supplied), str(token))
+        return bool(supplied) and hmac.compare_digest(str(supplied).encode(), str(token).encode())
 
     def _deny(self, code, msg="Not available on the public endpoint."):
         self._json({"ok": False, "error": msg}, code)
@@ -3033,17 +3324,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         if self._is_public() and not self._public_get_ok():
             return
+        self.path = urllib.parse.urlsplit(self.path).path + ("?" + urllib.parse.urlsplit(self.path).query if self.path.startswith("/api/poster?") else "")
         if self.path == "/api/status":
             with STATE_LOCK:
                 state = json.loads(json.dumps(STATE))
             state["dismissed"] = load_dismissed()
             cfg = get_config()
+            last = state.get("last_poll_epoch", 0)
+            state["stale"] = not last or time.time() - last > max(90, cfg.get("poll_interval", 30) * 3)
+            state["version"] = CURRENT_VERSION
+            state["search_instances"] = [{"service": n, "label": s.get("label", n), "kind": kind}
+                for kind, spec in MEDIA_KINDS.items() for n, s in active_instances(cfg, (spec["service"],))
+                if s.get("url") and s.get("api_key")]
             # surface display-relevant flags + onboarding needs
             svc_meta = {}
             onboarding = []
             for name, svc in cfg["services"].items():
                 miss = [] if svc.get("disabled") else missing_credentials(svc)
                 svc_meta[name] = {
+                    "label": svc.get("label", name), "app": service_app(name, svc),
                     "type": svc.get("type"),
                     "enabled": svc.get("enabled", True),
                     "disabled": svc.get("disabled", False),
@@ -3082,6 +3381,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             state["service_catalog"] = [
                 {
                     "service": name,
+                    "label": svc.get("label", name), "app": service_app(name, svc),
                     "type": svc.get("type"),
                     "url": svc.get("url", ""),
                     "fields": list(dict.fromkeys(["url"] + REQUIRED_FIELDS.get(svc.get("type"), []))),
@@ -3106,9 +3406,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return True
             search_kinds = []
             for k, spec in MEDIA_KINDS.items():
-                s = cfg["services"].get(spec["service"], {})
-                ready = (not s.get("disabled")) and s.get("url") and s.get("api_key")
-                if ready and _can_search(spec["service"]):
+                ready = any(s.get("url") and s.get("api_key") and _can_search(n)
+                            for n, s in active_instances(cfg, (spec["service"],)))
+                if ready:
                     search_kinds.append(k)
             state["search_kinds"] = search_kinds
             state["poll_interval"] = cfg.get("poll_interval", POLL_INTERVAL)
@@ -3141,7 +3441,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._json(get_config())
 
         elif self.path == "/api/history":
-            self._json({"ok": True, "uptime": uptime_percentages(), **history_summary()})
+            self._json({"ok": True, "uptime": uptime_percentages(), "actions": _read_json(ACTION_FILE, [])[-50:][::-1], **history_summary()})
 
         elif self.path == "/api/stats":
             data = get_stats(get_config())
@@ -3160,7 +3460,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if data:
                 self.send_response(200)
                 self.send_header("Content-Type", ct)
-                self.send_header("Cache-Control", "max-age=300")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("X-Content-Type-Options", "nosniff")
                 self.end_headers()
                 self.wfile.write(data)
             else:
@@ -3189,11 +3490,38 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 page = page.replace("<head>", "<head>" + flag, 1)
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("X-Frame-Options", "DENY")
+            self.send_header("Content-Security-Policy", "frame-ancestors 'none'; object-src 'none'; base-uri 'self'")
+            self.send_header("Referrer-Policy", "no-referrer")
             self.end_headers()
             self.wfile.write(page.encode())
 
     def do_POST(self):
-        body = self._read_body()
+        # Authenticate before reading a potentially slow or oversized body.
+        if self._is_public() and not self._public_token_ok():
+            return self._deny(401, "Token required.")
+        origin = self.headers.get("Origin")
+        if origin and urllib.parse.urlsplit(origin).netloc != self.headers.get("Host"):
+            return self._deny(403, "Cross-origin writes are not allowed.")
+        if self.headers.get("Sec-Fetch-Site") == "cross-site":
+            return self._deny(403, "Cross-site writes are not allowed.")
+        if self.headers.get("Content-Length", "0") != "0" and self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower() != "application/json":
+            return self._deny(415, "Use application/json.")
+        try:
+            body = self._read_body()
+        except (ValueError, TypeError):
+            return self._json({"ok": False, "error": "Expected a JSON object under 1 MB."}, 400)
+        for key in ("service", "action", "kind", "term", "root_folder", "id"):
+            if key in body and not isinstance(body[key], str):
+                return self._json({"ok": False, "error": f"{key} must be text."}, 400)
+        for key in ("params", "item"):
+            if key in body and not isinstance(body[key], dict):
+                return self._json({"ok": False, "error": f"{key} must be an object."}, 400)
+        for key in ("profile_id", "root_folder_id"):
+            if body.get(key) is not None and (not isinstance(body[key], int) or isinstance(body[key], bool)):
+                return self._json({"ok": False, "error": f"{key} must be an integer."}, 400)
 
         # Public port: only the allowlisted POSTs, behind the token, each behind its
         # own opt-in. Requests (search/add) need allow_requests; remediation needs
@@ -3237,36 +3565,59 @@ class Handler(http.server.BaseHTTPRequestHandler):
             new_cfg = body.get("config")
             if not isinstance(new_cfg, dict) or "services" not in new_cfg:
                 return self._json({"ok": False, "error": "invalid config"}, 400)
-            new_cfg = _merge_defaults(new_cfg)
+            try:
+                new_cfg = validate_config(new_cfg)
+            except (ValueError, TypeError) as e:
+                return self._json({"ok": False, "error": str(e)}, 400)
             with CONFIG_LOCK:
+                try:
+                    save_config(new_cfg)
+                except OSError:
+                    return self._json({"ok": False, "error": "Could not save settings; previous settings retained."}, 500)
                 CONFIG.clear()
                 CONFIG.update(new_cfg)
             with _STATS_LOCK:
                 _STATS_CACHE["ts"] = 0.0  # force a fresh stats compute (e.g. lite_stats toggled)
-            save_config(get_config())
             REFRESH_NOW.set()  # apply immediately
             return self._json({"ok": True})
+
+        if self.path == "/api/test-service":
+            name = body.get("service", "")
+            svc = body.get("config")
+            try:
+                cfg = validate_config({"services": {name: svc}})
+                svc = cfg["services"][name]
+                missing = missing_credentials(svc)
+                if missing:
+                    return self._json({"ok": False, "error": "Missing: " + ", ".join(missing)})
+                result = CHECKERS[svc["type"]](name, svc)
+                return self._json({"ok": result["level"] != "error", "result": result})
+            except Exception as e:
+                return self._json({"ok": False, "error": str(e)}, 400)
 
         if self.path == "/api/search":
             kind = body.get("kind", "movie")
             term = (body.get("term") or "").strip()
             if not term:
                 return self._json({"ok": False, "error": "empty search"}, 400)
-            return self._json(media_search(get_config(), kind, term))
+            return self._json(media_search(get_config(), kind, term, body.get("service")))
 
         if self.path == "/api/profiles":
             kind = body.get("kind", "movie")
-            return self._json(media_profiles(get_config(), kind))
+            return self._json(media_profiles(get_config(), kind, body.get("service")))
 
         if self.path == "/api/add":
             kind = body.get("kind", "movie")
             item = body.get("item", {})
             profile_id = body.get("profile_id")
-            result = media_add(get_config(), kind, item, profile_id)
+            if not isinstance(item, dict):
+                return self._json({"ok": False, "error": "Invalid media item."}, 400)
+            result = media_add(get_config(), kind, item, profile_id, body.get("service"), body.get("root_folder_id", body.get("root_folder")))
             # remember the chosen profile as the default for next time
             if result.get("ok") and profile_id is not None:
                 with CONFIG_LOCK:
-                    CONFIG.setdefault("default_profiles", {})[kind] = profile_id
+                    instance = resolve_media_service(CONFIG, kind, body.get("service"))
+                    CONFIG.setdefault("default_profiles", {})[instance or kind] = profile_id
                 save_config(get_config())
             return self._json(result)
 
@@ -3294,6 +3645,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                         "If you can read this, Pushover notifications are working.",
                                         level="info")
                 (sent if ok else failed).append("Pushover" if ok else f"Pushover ({err})")
+            if notif.get("telegram_enabled") and (notif.get("telegram_token") or "").strip() and (notif.get("telegram_chat") or "").strip():
+                ok, err = send_telegram(notif, "GuardTowarr test",
+                                        "If you can read this, Telegram notifications are working.",
+                                        level="info")
+                (sent if ok else failed).append("Telegram" if ok else f"Telegram ({err})")
             if not sent and not failed:
                 return self._json({"ok": False, "error": "No notification channel is enabled."})
             return self._json({"ok": bool(sent), "sent": sent, "failed": failed,
@@ -3313,7 +3669,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not fn:
                 return self._json({"ok": False, "error": "Unknown action."}, 400)
             try:
-                result = fn(service, svc, params)
+                result = execute_action(cfg, service, action, params)
             except Exception as e:
                 result = {"ok": False, "error": f"Action failed: {e}"}
             if result.get("ok"):
@@ -3408,6 +3764,192 @@ def run_tray(port):
     icon = pystray.Icon("GuardTowarr", _make_tray_image(), "GuardTowarr", menu)
     icon.run()  # blocks on the main thread
     return True
+
+
+def _read_json(path, fallback):
+    try:
+        with open(path, encoding="utf-8") as f:
+            value = json.load(f)
+        return value if isinstance(value, type(fallback)) else copy.deepcopy(fallback)
+    except (OSError, ValueError):
+        return copy.deepcopy(fallback)
+
+
+OBSERVATION_FILE = os.path.join(DATA_DIR, "observations.json")
+OBSERVATION_LOCK = threading.Lock()
+_OBS_LAST = {}
+ACTION_FILE = os.path.join(DATA_DIR, "actions.json")
+ACTION_LOCK = threading.Lock()
+_ACTION_RUNNING = set()
+
+
+def record_observations(results, interval):
+    now = time.time()
+    cutoff = now - 30 * 86400
+    with OBSERVATION_LOCK:
+        data = _read_json(OBSERVATION_FILE, {})
+        for name, result in results.items():
+            periods = data.setdefault(name, [])
+            previous = _OBS_LAST.get(name)
+            if previous and 0 < now - previous[0] <= max(120, interval * 3):
+                start, healthy = previous
+                if periods and periods[-1][1] == start and periods[-1][2] == healthy:
+                    periods[-1][1] = now
+                else:
+                    periods.append([start, now, healthy])
+            _OBS_LAST[name] = (now, result.get("level") == "ok")
+        for name in list(_OBS_LAST):
+            if name not in results:
+                _OBS_LAST.pop(name, None)
+        data = {name: [r for r in rows if r[1] > cutoff] for name, rows in data.items()}
+        atomic_json(OBSERVATION_FILE, data)
+
+
+def resolve_media_service(cfg, kind, service=None):
+    spec = MEDIA_KINDS.get(kind)
+    if not spec:
+        return None
+    choices = [n for n, s in active_instances(cfg, (spec["service"],)) if s.get("api_key") and s.get("url")]
+    if service:
+        return service if service in choices else None
+    return choices[0] if len(choices) == 1 else None
+
+
+def duration_seconds(value):
+    try:
+        parts = [float(v) for v in str(value).split(":")]
+        return int(sum(v * 60 ** i for i, v in enumerate(reversed(parts))))
+    except (ValueError, TypeError):
+        return 0
+
+
+def arr_queue_records(svc):
+    rows = []
+    for page in range(1, 101):
+        query = urllib.parse.urlencode({"page": page, "pageSize": 200,
+                                       "includeUnknownMovieItems": "true", "includeUnknownSeriesItems": "true"})
+        _, body = http_get(svc["url"].rstrip("/") + "/api/v3/queue?" + query, {"X-Api-Key": svc["api_key"]})
+        data = json.loads(body)
+        rows.extend(data["records"])
+        if len(rows) >= data.get("totalRecords", len(rows)):
+            return rows
+    raise ValueError("Queue exceeds supported pagination limit")
+
+
+def execute_action(cfg, service, action, params, automatic=False):
+    svc = cfg.get("services", {}).get(service)
+    allowed = {"arr": {"test_download_clients", "test_indexers", "queue_fix"},
+               "qbit": {"qbit_recheck", "qbit_reannounce"}}
+    if not svc or svc.get("disabled") or not svc.get("enabled", True):
+        return {"ok": False, "error": "Service is disabled or missing."}
+    if action not in allowed.get(svc.get("type"), set()) or not isinstance(params, dict):
+        return {"ok": False, "error": "Action is not supported by this service."}
+    key = (service, action, json.dumps(params, sort_keys=True))
+    event = {"id": str(time.time_ns()), "ts": time.time(), "service": service,
+             "action": action, "automatic": automatic, "status": "pending"}
+    with ACTION_LOCK:
+        if key in _ACTION_RUNNING:
+            return {"ok": False, "error": "This action is already running."}
+        events = _read_json(ACTION_FILE, [])[-199:]
+        events.append(event)
+        atomic_json(ACTION_FILE, events)
+        _ACTION_RUNNING.add(key)
+    try:
+        result = ACTIONS[action](service, svc, params)
+    except Exception as e:
+        result = {"ok": False, "error": str(e)}
+    try:
+        with ACTION_LOCK:
+            events = _read_json(ACTION_FILE, [])
+            for entry in events:
+                if entry.get("id") == event["id"]:
+                    entry.update(status="succeeded" if result.get("ok") else "partial" if result.get("partial") else "failed",
+                                 message=result.get("message") or result.get("error"), finished_at=time.time())
+            atomic_json(ACTION_FILE, events)
+    except OSError:
+        # The upstream action has already happened. Keep its actual outcome and
+        # warn about the pending audit entry instead of encouraging a retry.
+        field = "message" if result.get("ok") else "error"
+        result[field] = (result.get(field) or "Action completed.") + " Action history could not be updated; verify the upstream state before retrying."
+    finally:
+        with ACTION_LOCK:
+            _ACTION_RUNNING.discard(key)
+    if result.get("ok") or result.get("partial"):
+        REFRESH_NOW.set()
+    return result
+
+
+def public_payload(value, cfg):
+    """Scrub every response, including history, action errors, and upstream text."""
+    secrets = set()
+    hosts = set()
+    def gather(obj):
+        if isinstance(obj, dict):
+            for key, val in obj.items():
+                if isinstance(val, str):
+                    if any(k in key for k in ("password", "token", "api_key", "webhook", "username")) and val:
+                        secrets.add(val)
+                    if key == "url":
+                        host = urllib.parse.urlsplit(val).hostname
+                        if host:
+                            hosts.add(host)
+                gather(val)
+        elif isinstance(obj, list):
+            for item in obj:
+                gather(item)
+    gather(cfg)
+    safe_docs = {"wiki.servarr.com", "support.plex.tv", "jellyfin.org", "docs.docker.com",
+                 "sabnzbd.org", "nzbget.com", "cleanuparr.github.io", "tunarr.com", "docs.ombi.app",
+                 "docs.jellyseerr.dev", "github.com"}
+    def clean(obj, key=""):
+        if isinstance(obj, dict):
+            return {k: clean(v, k) for k, v in obj.items()
+                    if k not in ("api_key", "password", "token", "username", "thumb", "sound_url")}
+        if isinstance(obj, list):
+            return [clean(v, key) for v in obj]
+        if not isinstance(obj, str):
+            return obj
+        if key in ("url", "path", "host", "rootFolderPath", "poster"):
+            return ""
+        if key == "fix":
+            parsed = urllib.parse.urlsplit(obj)
+            if parsed.scheme not in ("http", "https") or parsed.hostname not in safe_docs or parsed.username:
+                return ""
+            return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", parsed.fragment))
+        for secret in sorted(secrets | hosts, key=len, reverse=True):
+            obj = obj.replace(secret, "[private]")
+            obj = obj.replace(urllib.parse.quote(secret, safe=""), "[private]")
+        obj = re.sub(r'https?://[^\s<>"\x27]+', '[private URL]', obj)
+        obj = re.sub(r'\b(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?\b', '[private address]', obj)
+        obj = re.sub(r'(?i)\b[a-z]:[\\/][^\s<>"\x27]*', '[private path]', obj)
+        obj = re.sub(r'\\\\[^\s]+', '[private path]', obj)
+        obj = re.sub(r'\b[\w.-]+\.(?:local|lan|internal)\b', '[private host]', obj, flags=re.I)
+        obj = re.sub(r'\[?[a-fA-F0-9]*:[a-fA-F0-9:]*:[a-fA-F0-9:]+\]?', '[private address]', obj)
+        obj = re.sub(r'(?<!\w)/(?:[^\s/]+/)+[^\s]*', '[private path]', obj)
+        return obj
+    return clean(copy.deepcopy(value))
+
+
+def validate_config(cfg):
+    if not isinstance(cfg, dict) or not isinstance(cfg.get("services"), dict):
+        raise ValueError("Configuration must contain a services object.")
+    if len(cfg["services"]) > 100:
+        raise ValueError("At most 100 service instances are supported.")
+    for name, svc in cfg["services"].items():
+        if not re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", name) or not isinstance(svc, dict):
+            raise ValueError("Invalid service instance.")
+        app = service_app(name, svc)
+        template = DEFAULT_CONFIG["services"].get(app)
+        if not template or svc.get("type", template["type"]) != template["type"]:
+            raise ValueError("Unknown service application or mismatched type.")
+        for field in ("url", "label", "api_key", "token", "username", "password", "containers"):
+            if field in svc and not isinstance(svc[field], str):
+                raise ValueError(f"{name}: {field} must be text.")
+        url = svc.get("url", "")
+        scheme = urllib.parse.urlsplit(url).scheme
+        if url and scheme not in (("http", "https", "unix") if template["type"] == "docker" else ("http", "https")):
+            raise ValueError(f"{name}: enter an HTTP(S) service URL.")
+    return _merge_defaults(cfg)
 
 
 def main():

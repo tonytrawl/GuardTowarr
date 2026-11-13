@@ -4,7 +4,7 @@
 
 **The watchtower for your media stack. It doesn't just tell you what broke, it helps you fix it.**
 
-Monitors **Radarr · Sonarr · Prowlarr · Readarr · Lidarr · Plex · Jellyfin · qBittorrent · Ombi · Seerr  · Tunarr** in one place.
+Monitors **Radarr · Sonarr · Prowlarr · Readarr · Lidarr · Plex · Jellyfin · qBittorrent · SABnzbd · NZBGet · Ombi · Seerr (Overseerr / Jellyseerr) · Tunarr · Cleanuparr · Docker** in one place.
 
 [![Docker Link](https://img.shields.io/badge/Docker-repo-blue?logo=docker)](https://hub.docker.com/r/tonytrawl/guardtowarr)
 [![Download](https://img.shields.io/badge/download-latest%20release-e5a00d)](../../releases/latest)
@@ -26,10 +26,10 @@ Monitors **Radarr · Sonarr · Prowlarr · Readarr · Lidarr · Plex · Jellyfin
   <!-- Second Row of Images -->
   <tr>
      <td align="center" width="35%">
-      <img src="https://github.com/tonytrawl/GuardTowarr/blob/main/screenshots/Mobile%20error%20view.png?raw=true" alt="" width="35%">
+      <img src="https://github.com/tonytrawl/GuardTowarr/blob/main/screenshots/Mobile%20All%20clear%20view.png?raw=true" alt="" width="35%">
     </td>
     <td align="center" width="50%">
-      <img src="https://github.com/tonytrawl/GuardTowarr/blob/main/screenshots/Quick%20Fix.png?raw=true" alt="" width="100%">
+      <img src="https://github.com/tonytrawl/GuardTowarr/blob/main/screenshots/movie%20search.png?raw=true" alt="" width="100%">
     </td>
   </tr>
 </table>
@@ -44,13 +44,14 @@ Monitors **Radarr · Sonarr · Prowlarr · Readarr · Lidarr · Plex · Jellyfin
 
 There are plenty of dashboards that show your services as green or red dots. GuardTowarr is built to do the part that actually saves you time: figure out what's wrong and help you fix it.
 
-- **It diagnoses, it doesn't just ping.** It logs into each app and reads that app's own health, so it catches things that are technically "up" but quietly broken (no indexers, a dead download client, a stalled or failed download, so much more).
-- **It fixes, not just reports.** Common problems get one-click actions right on the card: test download clients, re-test indexers, re-check or re-announce a stalled torrent, or remove and re-search a genuinely bad download. Nothing happens on its own; every fix is a button you press.
-- **It understands the whole stack, not one app.** The full *arr lineup, Plex and Jellyfin, qBittorrent, the request apps, and Tunarr, all in one screen instead of a tab per tool.
+- **It diagnoses, it doesn't just ping.** It logs into each app and reads that app's own health, so it catches things that are technically "up" but quietly broken (no indexers, a dead download client, a stalled or failed download).
+- **It points you to the right answer.** Every issue it surfaces carries a link straight to the relevant documentation: the matching Servarr wiki page, the qBittorrent FAQ, the correct Tunarr config page, and so on. You never have to guess which doc covers the error in front of you.
+- **It fixes, not just reports.** For the common problems it also offers one-click actions right on the card: test download clients, re-test indexers, re-check or re-announce a stalled torrent, or remove and re-search a genuinely bad download. Manual remediation is under your control; blocked-file automatic removal is separately opt-in.
+- **It understands the whole stack, not one app.** The full *arr lineup, Plex and Jellyfin, qBittorrent, the request apps, and Tunarr, all in one calm screen instead of a tab per tool.
 - **It runs off your server on purpose.** Put it on your everyday PC and it can tell you when the server itself goes down, not just when an app does.
-- **It's genuinely lightweight.** Two files and the Python standard library. No database, no heavy dependencies.
+- **It's genuinely lightweight.** Two files and the Python standard library. No database, no heavy dependencies, no build step. It runs from a single `.exe` or a small Docker image.
 - **Its alerts respect your time.** Edge-triggered (no spam while something stays down), with quiet hours, a grace period so brief blips stay quiet, and one summary instead of a flood when the whole stack reboots.
-- **You can check it from anywhere, safely.** An optional, token-protected remote view that never exposes your credentials or internal addresses.
+- **You can check it from anywhere, safely.** An optional, token-protected remote view that filters credentials and internal addresses from its responses. Keep it behind an HTTPS reverse proxy.
 
 ---
 
@@ -114,12 +115,34 @@ The system-tray feature is desktop-only and isn't part of the Docker image; the 
 
 ---
 
+## What's new in 2.0?
+
+Running more than one Radarr or Sonarr? You can now give each instance its own
+name and keep them all in the same dashboard. Pick the instance, quality profile,
+and root folder when you add a movie or show. No guessing which library it went to.
+
+- **SABnzbd gets a proper queue view.** See active downloads and recent failures
+  alongside your torrents.
+- **Cleanuparr joins the dashboard.** See its health checks and anything waiting
+  for manual attention. GuardTowarr reads the results; it doesn't run cleanup jobs.
+- **Keep an eye on Docker containers.** Pick the containers you care about and get
+  a heads-up when one stops, goes unhealthy, or disappears.
+- **Test before you save.** Check a service connection right from Settings.
+- **Know what a fix actually did.** Action history shows what worked, what failed,
+  and what only partly finished. A failed removal won't be called a success.
+- **A bit more care under the hood.** Safer config saves, better blocked-file checks,
+  faster polling, clearer stale-data warnings, and more work on the mobile view.
+
+Back up your config folder before updating. Your existing setup carries over and
+new services start turned off. See the [full changes](RELEASE_NOTES_v2.0.0.md)
+and [2.0 setup notes](docs/2.0.md).
+
 ## Features
 
 ### 🩺 Monitoring
 - One clean view of every service: **healthy**, **warning**, or **error**.
 - Surfaces each app's own internal health, not just whether it's online.
-- Checks on a timer (**every 30 seconds by default**, adjustable) with a manual refresh anytime.
+- Checks on a timer (**a 30-second interval between cycles by default**, adjustable) with a manual refresh anytime.
 - When everything's fine you get a calm **all-clear** screen; the moment something needs attention, only the cards that matter take over.
 - **Don't use a service?** Disable it and it disappears from the dashboard and stops being checked.
 
@@ -134,7 +157,8 @@ This is the part that sets GuardTowarr apart: it helps you clear the most common
 - **It's smart about which fix to suggest.** It tells a stall (your client, connection, or a lack of seeds) apart from a genuinely bad release, and leads with the right action for each. Mere stalls lead with the gentle fixes; the destructive remove is a clearly-warned last resort.
 - **Loop guard.** If you've already blocklisted a pile of releases for the same item and it's *still* failing, it warns you that the releases probably aren't the problem (it's your client or connection), so you don't get stuck in an endless remove-and-research loop.
 - **No noise.** It ignores normal pipeline states (like an archive waiting to be extracted), and "manual import required" is flagged for you to handle without a destructive button.
-- **Nothing happens on its own.** Every fix is a button you press, and anything that deletes a download asks you to confirm first.
+- **You choose when to act.** Manual fixes require a button press, and destructive manual actions ask for confirmation. Blocked-file automatic removal is a separate, explicit opt-in.
+- **Reliable, not noisy.** It tells real trouble apart from normal pipeline chatter (archives waiting to extract, a download that already imported, an import scan that's still finishing) and gives transient states a moment to clear, so the cards you see are the ones that actually need you.
 - Lives in the **Stability** tab and can be turned off entirely (which also stops the extra queue checks). Your core up/down monitoring and alerts are unaffected either way.
 
 ### 📖 Always linked to the fix
@@ -150,10 +174,10 @@ An optional check that scans the files inside your Radarr/Sonarr torrents for ri
 - **Off by default**, lives in the **Stability** tab, and the list of blocked extensions is fully editable.
 - By default it just **flags** anything it finds with a one-click remove, so you stay in control. There's an opt-in to have it remove and re-search automatically instead.
 
-
 ### 📱 Phone & chat alerts
-- Get pinged when something breaks (and again when it recovers) via any mix of **[ntfy](https://ntfy.sh)** (free phone push, no account needed), **Discord** (channel webhook), or **[Pushover](https://pushover.net)**. Turn on one channel or several.
+- Get pinged when something breaks (and again when it recovers) via any mix of **[ntfy](https://ntfy.sh)** (free phone push, no account needed), **Discord** (channel webhook), **[Pushover](https://pushover.net)**, or **Telegram** (your own bot). Turn on one channel or several.
 - Only alerts on **real changes**, so no spam while something stays down.
+- **Groups dependent alerts.** If Prowlarr or your download client goes down, the *arr apps all light up with the same downstream complaint. GuardTowarr recognizes that and alerts you once about the real cause, instead of firing a separate alert for every app that depends on it.
 - Choose **errors only** or **warnings too**, and **mute** specific services.
 - **Quiet hours** so it won't wake you at 3am; anything overnight arrives as one tidy summary in the morning.
 - **No startup floods.** When GuardTowarr or your server restarts, it holds alerts during a short settle window and sends a single summary of whatever is still wrong, instead of blasting you while everything boots.
@@ -162,28 +186,28 @@ An optional check that scans the files inside your Radarr/Sonarr torrents for ri
 - **Torrent finished alerts** (beta): a ping like "Dune: Part Two finished downloading", using the clean title from Radarr/Sonarr.
 - Send a **test notification** to confirm each channel.
 
-### 🔎 Search & add movies, shows, books & music
+### 🔎 Search movies, shows, books & music
 - Built-in search with **poster previews**.
 - Search **movies** (Radarr), **shows** (Sonarr), **books** (Readarr), and **music** (Lidarr).
-- Pick something, confirm the **quality profile**, and it's sent to the right app to grab.
+- For movies and shows, choose the **service instance**, **quality profile**, and **root folder** before adding. Books and music are search-only; add them directly in Readarr/Lidarr.
 - Search options only appear for the apps you've set up and enabled, and it remembers your usual quality profile.
 - No extra API keys needed; it reuses the apps you've already connected.
 
 ### 📊 History & uptime
 - Logs every time a service goes down and recovers, kept for **30 days**.
-- Per-service **30-day uptime** with a small inline bar, plus outage counts for the last day, week, and month.
+- Per-service **observed health over the last 30 days**, with a small inline bar and outage counts. Time while the monitor was stopped is unknown; new installations do not assume 30 days of perfect health.
 - See real numbers like *"Radarr has gone down 4 times this week"* instead of guessing.
 
 ### 📈 Live stats
 - When everything's healthy, the all-clear screen shows live stats right below it.
-- **Library counts** (movies, episodes), pulled from Plex/Jellyfin when you have them and never double-counted when you run both, plus **active torrents** and **uptime %** at a glance.
+- **Library counts** (movies, episodes), pulled from Plex/Jellyfin when you have them and shown separately by server, with the largest library count used for the headline estimate, plus **active torrents** and **uptime %** at a glance.
 - **Now playing on Plex and/or Jellyfin**: who's watching what, direct play vs transcode, with progress and a tag showing which server it's on.
 - **Per-drive storage** bars that turn amber then red as a drive fills up, and a 24-hour **streams** graph.
 - **Lite stats mode** (in the Stability tab): running everything on a low-power box like a Pi or NAS? Switch the panel to a lightweight uptime-only view to cut background load on your servers. Monitoring, warnings, and alerts are completely unaffected.
 
 ### 🌀 Active torrents
 - A view of what's **downloading** and **seeding**, switchable between the two.
-- Full detail (live speeds, ratio, ETA) if you use **qBittorrent**.
+- Combined downloads across configured instances: qBittorrent details, SABnzbd queue progress/ETA, and Radarr/Sonarr queue fallback. Source failures remain visible.
 - No qBittorrent? It falls back to the **Radarr/Sonarr download queue**, so it still works with whatever client you use (Transmission, Deluge, etc.).
 
 ### 🌐 Remote access (advanced)
@@ -214,7 +238,11 @@ GuardTowarr doesn't just ping a port. For each service it logs in with your cred
 | **Plex** | Server reachability, token validity, and whether libraries respond (distinguishes "down" from "up but libraries not responding"). Feeds the live now-playing view. |
 | **Jellyfin** _(beta)_ | Server reachability plus API key validity. Also feeds the live now-playing view. |
 | **qBittorrent** | Online status, bad-credential detection, and torrents stuck in error / missing-files / stalled states (with a grace period so brief stalls don't cry wolf). |
-| **Ombi / Overseerr / Jellyseerr** | Reachability plus API key validity via the status endpoint. |
+| **SABnzbd / NZBGet** _(beta)_ | Reachability, credential/API-key validity, and a warning when the download queue is paused. SABnzbd also provides active downloads and recent failed-download reports. Brings Usenet downloaders into the same dashboard as your torrent client. |
+| **Ombi** | Reachability plus API key validity via the status endpoint. |
+| **Seerr** (Overseerr / Jellyseerr) | Reachability plus API key validity via the status endpoint. One service covers either app, since they share the same API. |
+| **Cleanuparr** | Detailed health and unresolved action-required dashboard events; no cleanup jobs are triggered. |
+| **Docker** | Running/stopped/unhealthy containers through a Unix socket or restricted HTTP(S) proxy, with optional exact-name filtering. |
 | **Tunarr** _(beta)_ | Reachability plus Tunarr's own health checks (ffmpeg version, hardware acceleration, transcode directory, etc.), each surfaced as a warning or error with a link to the relevant Tunarr docs page. |
 
 Every service reports one of three states (healthy, warning, or error), with real outages kept separate from minor warnings. Any issue can be dismissed and stays hidden until it recurs.
@@ -258,7 +286,7 @@ A native macOS build may follow if there's interest. Either way, open an issue a
 
 ## Contributing
 
-Bug reports, fixes, and new service integrations are welcome. The whole app is driven by one service registry, so adding a monitored service is two small steps. See [CONTRIBUTING.md](CONTRIBUTING.md) and [docs/adding-a-service.md](docs/adding-a-service.md).
+Bug reports, fixes, and new service integrations are welcome. The app uses one service registry, and named instances can be added from Settings. See [CONTRIBUTING.md](CONTRIBUTING.md) and [docs/adding-a-service.md](docs/adding-a-service.md).
 
 ## Feedback
 

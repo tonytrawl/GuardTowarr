@@ -28,6 +28,12 @@ are gitignored; do not commit them, they contain your credentials.
 
 ## Before you open a PR
 
+Run `python -B -m unittest discover -s tests -v` and
+`python tools/check_frontend.py`. Tests use temporary data and simulated services.
+Use `python tools/preview.py` for an isolated browser preview. See
+[2.0 notes](docs/2.0.md) for instance contracts and release validation.
+
+
 - Syntax-check the backend: `python -c "import ast; ast.parse(open('monitor.py').read())"`
 - If you touched the frontend, check the inline script: extract the last
   `<script>` block and run `node --check` on it. A passing parse is the minimum;

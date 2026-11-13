@@ -1,0 +1,35 @@
+# Runtime data — created on first run. config.json holds your API keys, tokens,
+# and the remote-access secret. NEVER commit these.
+config.json
+dismissed.json
+history.json
+observations.json
+actions.json
+config.json.*
+.review-backup/
+.test-runtime/
+qbit_extension_report.html
+ext_scan_test.py
+config/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# PyInstaller build output
+build/
+dist/
+*.spec
+
+# Local-only notes and scratch files (not part of the project)
+CLAUDE.md
+demo*.html
+design-*.html
+_*.py
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+.release-worktree/

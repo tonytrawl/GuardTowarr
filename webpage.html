@@ -438,7 +438,7 @@
   .hist-card .hc-name{font-size:14px;font-weight:600;text-transform:capitalize;margin-bottom:8px}
   .hist-card .hc-row{display:flex;justify-content:space-between;font-size:13px;color:var(--text-2);padding:2px 0}
   .hist-card .hc-row b{color:var(--text)}
-  /* inline 30-day uptime: label+% on one line, thin bar underneath (no extra footprint) */
+  /* inline Observed health · 30d: label+% on one line, thin bar underneath (no extra footprint) */
   .hc-up{display:flex;justify-content:space-between;align-items:baseline;font-size:11.5px;color:var(--text-2);margin-bottom:4px}
   .hc-up b{font-size:13px;color:var(--text)}
   .hc-upbar{height:4px;background:var(--fill);border-radius:4px;overflow:hidden;margin-bottom:9px}
@@ -491,6 +491,14 @@
     padding:13px 22px;border-radius:16px;box-shadow:0 12px 40px rgba(0,0,0,.3);font-size:14px;font-weight:500;
     z-index:80;opacity:0;transition:transform .4s var(--ease),opacity .4s var(--ease);max-width:90vw}
   .toast.show{transform:translateX(-50%) translateY(0);opacity:1}
+
+  .instance-tools{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:18px}
+  .instance-tools select,#searchInstance{max-width:220px;padding:8px;background:var(--surface);color:inherit;border:1px solid var(--border);border-radius:8px}
+  button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid var(--amber);outline-offset:3px}
+  .group-fields [role=status]{margin-top:10px;overflow-wrap:anywhere}
+  .issue-msg,.tor-name,.he-body{overflow-wrap:anywhere;min-width:0}
+  #freshness[hidden]{display:none}
+  @media(max-width:600px){.search-inner{flex-wrap:wrap}.search-inner input{min-width:160px}.kind-seg{flex-wrap:wrap}#searchInstance{max-width:100%}.modal{max-width:calc(100vw - 24px)}.group-h{gap:8px}.group-fields{grid-template-columns:1fr}}
 </style>
 </head>
 <body>
@@ -512,7 +520,7 @@
       </div>
     </div>
     <div class="hdr-actions">
-      <button class="icon-btn" id="torrentToggle" title="Active torrents" onclick="toggleTorrents()">
+      <button class="icon-btn" id="torrentToggle" title="Active downloads" onclick="toggleTorrents()">
         <svg viewBox="0 0 24 24"><path d="M12 3v12"/><polyline points="7 10 12 15 17 10"/><line x1="5" y1="20" x2="19" y2="20"/></svg>
       </button>
       <button class="icon-btn" id="searchToggle" title="Search to add media" onclick="toggleSearch()">
@@ -533,16 +541,17 @@
     </div>
   </header>
 
+  <div id="freshness" role="status" class="tor-notice">Waiting for fresh monitoring data. Displayed results may be out of date.</div>
   <!-- slide-in search -->
   <div class="searchbar" id="searchbar">
     <div class="search-inner">
       <svg class="mag" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.5" y2="16.5"/></svg>
       <input id="searchInput" type="text" placeholder="Search movies or shows to add…" autocomplete="off">
-      <div class="kind-seg">
+      <select id="searchInstance" aria-label="Search service instance" onchange="runSearch()"></select><div class="kind-seg">
         <button id="kindMovie" class="active" onclick="setKind('movie')" data-kind="movie">Movie</button>
         <button id="kindSeries" onclick="setKind('series')" data-kind="series">Show</button>
-        <button id="kindBook" onclick="setKind('book')" data-kind="book" style="display:none">Book</button>
-        <button id="kindMusic" onclick="setKind('music')" data-kind="music" style="display:none">Music</button>
+        <button id="kindBook" onclick="setKind('book')" data-kind="book" style="display:none">Book (search only)</button>
+        <button id="kindMusic" onclick="setKind('music')" data-kind="music" style="display:none">Music (search only)</button>
       </div>
       <button class="search-close" onclick="toggleSearch()">✕</button>
     </div>
@@ -727,7 +736,7 @@
 
     <!-- SERVICES -->
     <div class="tabpane" data-pane="services" style="display:none">
-      <div id="serviceGroups"></div>
+      <div class="instance-tools"><label for="instanceApp">Add another service</label><select id="instanceApp"></select><button class="btn tint" onclick="addInstance()">Add instance</button></div><div id="serviceGroups"></div>
     </div>
 
     <!-- NOTIFICATIONS -->
@@ -781,6 +790,21 @@
               <div class="beta-note" style="margin-top:8px">If you use Pushover's built-in quiet hours / after-hours mode, turn <b>off</b> GuardTowarr's own Quiet hours below to avoid both holding alerts and getting a doubled-up experience.</div>
             </div>
           </div>
+          <div class="toggle-line" style="margin-top:6px">
+            <div><div class="tl-text">Telegram</div><div class="tl-sub">Send alerts to a Telegram chat via a bot</div></div>
+            <label class="switch"><input type="checkbox" id="telegramEnabled"><span class="track"></span></label>
+          </div>
+          <div id="telegramFields" class="sub-block">
+            <div class="field">
+              <label>Bot token</label>
+              <input id="telegramToken" type="text" placeholder="123456789:ABCdefGhIJKlmNoPQRsTUVwxyz">
+            </div>
+            <div class="field" style="margin-bottom:0">
+              <label>Chat ID</label>
+              <input id="telegramChat" type="text" placeholder="Your chat or channel ID, e.g. 123456789">
+              <div class="tl-sub" style="margin-top:6px">In Telegram: message <b>@BotFather</b> to create a bot and copy its token. Then message your bot once and get your chat ID from <b>@userinfobot</b> (or @RawDataBot).</div>
+            </div>
+          </div>
         </div>
 
         <div class="set-section">
@@ -795,6 +819,10 @@
           <div class="toggle-line">
             <div><div class="tl-text">Notify on recovery</div><div class="tl-sub">When a service becomes healthy again</div></div>
             <label class="switch"><input type="checkbox" id="notifRecovery"><span class="track"></span></label>
+          </div>
+          <div class="toggle-line">
+            <div><div class="tl-text">Group dependent alerts</div><div class="tl-sub">When Prowlarr or a download client is down, don't also alert for every *arr that depends on it</div></div>
+            <label class="switch"><input type="checkbox" id="notifDependency"><span class="track"></span></label>
           </div>
           <div class="toggle-line">
             <div><div class="tl-text">Torrent finished alerts <span class="beta-tag">beta</span> <button class="info-btn" onclick="openHelp('torrent_done')" aria-label="About torrent alerts">ⓘ</button></div><div class="tl-sub">Notify when a download completes</div></div>
@@ -891,7 +919,7 @@
     </div>
     <div class="field">
       <label>Quality profile</label>
-      <select id="profileSelect"></select>
+      <select id="profileSelect" aria-label="Quality profile"></select></div><div class="field"><label for="rootSelect">Root folder</label><select id="rootSelect"></select>
     </div>
     <div class="modal-actions">
       <button class="btn" onclick="closeConfirm()">Cancel</button>
@@ -968,9 +996,9 @@
 
 <div class="toast" id="toast"></div>
 
-<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js" integrity="sha384-dug+JxfBvklEQdJ4AYuBBAIScUz0bVN73xpy273gcAwHjb3qI0fXmuYNaNfdyYJG" crossorigin="anonymous"></script>
 <script>
-const FIELD_LABELS = {url:"Server URL", api_key:"API Key", token:"Plex Token", username:"Username", password:"Password"};
+const FIELD_LABELS = {label:"Display name", containers:"Container names (comma-separated; blank monitors all)", url:"Server URL", api_key:"API Key", token:"Plex Token", username:"Username", password:"Password"};
 
 /* ---------- restricted public mode ----------
    The server injects window.GT_PUBLIC on the public port. In that mode every
@@ -995,6 +1023,7 @@ if (GT_PUBLIC) {
 let prevAlertCount = 0, notifyReady = false;
 let dismissedMap = {}, view = "active", servicesCache = [], serviceMeta = {}, onboarding = [];
 let setupComplete = true, serviceCatalog = [];
+let searchInstances = [], searchGeneration = 0, staleStatus = true, pollInterval = 30;
 let searchKinds = ["movie","series"];
 let fullConfig = null;       // loaded for settings
 let theme = "auto";
@@ -1004,6 +1033,7 @@ let lastPollTs = null;       // for relative "x min ago"
 let firstLoad = true;
 let localSoundData = null;   // session-only data URL from a picked file
 let prevErrorServices = new Set();  // for flash/sound on NEW error
+const runningActions = new Set();
 let issueActionsMap = {};    // issue id -> its remediation action descriptors (from /api/status)
 
 if ("Notification" in window && Notification.permission === "default") {
@@ -1011,6 +1041,10 @@ if ("Notification" in window && Notification.permission === "default") {
 } else if ("Notification" in window) { notifyReady = Notification.permission === "granted"; }
 
 function rank(l){ return l==="error"?2:l==="warning"?1:0 }
+function safeHttpUrl(value){
+  try { const url=new URL(String(value)); return ["http:","https:"].includes(url.protocol)&&!url.username&&!url.password?url.href:""; }
+  catch(e){ return ""; }
+}
 function esc(s){return String(s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]))}
 function lvlClass(l){ return l==="error"?"err":l==="warning"?"warn":"ok" }
 function applyTheme(t){ document.documentElement.setAttribute("data-theme", t); theme=t; }
@@ -1082,7 +1116,10 @@ async function refresh(){
     const resp = await fetch("/api/status");
     if(GT_PUBLIC && resp.status===401){ showPublicLogin(); return; }  // need a (valid) token
     const data = await resp.json();
-    lastPollTs = data.last_poll ? Date.parse(data.last_poll.replace(" ","T")) : null;
+    lastPollTs = data.last_poll_epoch ? data.last_poll_epoch*1000 : null;
+    staleStatus = !!data.stale; pollInterval = data.poll_interval || 30;
+    document.getElementById("freshness").hidden = !staleStatus;
+    searchInstances = data.search_instances || [];
     const lpEl=document.getElementById("lastpoll");
     lpEl.textContent = relTime(lastPollTs);
     dismissedMap = data.dismissed || {};
@@ -1092,13 +1129,13 @@ async function refresh(){
     setupComplete = data.setup_complete !== false;
     serviceCatalog = data.service_catalog || [];
     searchKinds = data.search_kinds || ["movie","series"];
-    syncSearchKinds();
+    syncSearchKinds(); syncSearchInstances();
     uiConfig = data.ui || uiConfig;
     if(data.theme && data.theme!==theme) applyTheme(data.theme);
     firstLoad = false;
     paint();
     maybeOnboard();
-  }catch(e){ document.getElementById("lastpoll").textContent = "offline"; }
+  }catch(e){ document.getElementById("lastpoll").textContent = "offline"; document.getElementById("freshness").hidden=false; }
 }
 
 function visibleServices(){
@@ -1122,27 +1159,27 @@ function buildCard(s, meta, showDismissed){
   const all = s.errors||[];
   const issues = all.filter(e=>showDismissed?dismissedMap[e.id]:!dismissedMap[e.id]);
   const active = all.filter(e=>!dismissedMap[e.id]);
-  let dl=s.level; if(s.level!=="ok"&&active.length===0) dl="ok";
+  let dl=s.level; if(s.level!=="ok"&&all.length>0&&active.length===0) dl="ok";
   const lc=lvlClass(dl);
 
   let issuesHtml="";
   if(issues.length){
     issuesHtml='<div class="hr"></div><div class="issues">'+issues.map(e=>{
       const isD=!!dismissedMap[e.id];
-      const act=isD?`<button class="link-btn" onclick="restore('${e.id}')">Restore</button>`
+      const act=GT_PUBLIC?"":isD?`<button class="link-btn" onclick="restore('${e.id}')">Restore</button>`
                    :`<button class="link-btn" onclick="dismiss('${e.id}')">Dismiss</button>`;
       // one-click remediation buttons (only present when the backend attached
       // them, which is gated by the beta "remediation" toggle)
       let actsHtml="";
       if(!isD && e.actions && e.actions.length){
-        issueActionsMap[e.id]=e.actions.map(a=>({...a, service:e.service}));
+        issueActionsMap[e.id]=e.actions.map(a=>({...a, service:a.service||e.service}));
         actsHtml=e.actions.map((a,ai)=>
           `<button class="link-btn${a.destructive?" danger":""}" onclick="runAction('${e.id}',${ai})">${esc(a.label)}</button>`).join("");
       }
-      return `<div class="issue ${e.level} ${isD?'dismissed':''}"><div class="stripe"></div>
+      return `<div class="issue ${esc(e.level)} ${isD?'dismissed':''}"><div class="stripe"></div>
         <div class="issue-body">${e.source?`<div class="issue-src">${esc(e.source)}</div>`:""}
         <div class="issue-msg">${esc(e.message)}${isD?' <em>· dismissed</em>':''}</div>
-        ${e.fix?`<div class="issue-fix"><a href="${esc(e.fix)}" target="_blank" rel="noopener">${e.fix_label?esc(e.fix_label):"View documentation ↗"}</a></div>`:""}
+        ${safeHttpUrl(e.fix)?`<div class="issue-fix"><a href="${esc(safeHttpUrl(e.fix))}" target="_blank" rel="noopener">${e.fix_label?esc(e.fix_label):"View documentation ↗"}</a></div>`:""}
         <div class="issue-act">${actsHtml}${act}</div></div></div>`;
     }).join("")+'</div>';
   }
@@ -1151,10 +1188,10 @@ function buildCard(s, meta, showDismissed){
     : `<span class="badge ${lc}"><span class="d"></span>${dl==="ok"?"Healthy":dl==="warning"?"Warning":"Error"}</span>`;
   const setupRow = meta.needs_setup
     ? `<div class="setup-row"><button class="btn tint" onclick="openSettings('${s.name}')">Add credentials</button></div>` : "";
-  const url = meta.url || "";
+  const url = safeHttpUrl(meta.url);
   const title = url
-    ? `<a class="svc svc-link" href="${esc(url)}" target="_blank" rel="noopener" title="Open ${esc(s.name)}" onclick="event.stopPropagation()">${esc(s.name)} <span class="ext">↗</span></a>`
-    : `<span class="svc">${esc(s.name)}</span>`;
+    ? `<a class="svc svc-link" href="${esc(url)}" target="_blank" rel="noopener" title="Open ${esc(meta.label||s.name)}" onclick="event.stopPropagation()">${esc(meta.label||s.name)} <span class="ext">↗</span></a>`
+    : `<span class="svc">${esc(meta.label||s.name)}</span>`;
   const inner = `<div class="ch">${title}${badge}</div>
     <div class="summary">${esc(s.summary)}</div>
     <div class="checked">Checked ${esc(s.checked||"")}</div>${setupRow}${issuesHtml}`;
@@ -1294,7 +1331,7 @@ function paint(){
     toolbar.style.display="flex";
     statsBtn.style.display = showDismissed ? "none" : "grid";  // popup available when issues present
     hero.style.display = (!showDismissed && services.length)?"flex":"none";
-    if(errCount){ setHero(icon,"err","!",`${errCount} service${errCount>1?"s":""} need attention`,
+    if(errCount){ setHero(icon,"err","!",`${errCount} service${errCount>1?"s need":" needs"} attention`,
         warnCount?`Plus ${warnCount} warning${warnCount>1?"s":""}`:"Errors detected across your stack"); }
     else if(warnCount){ setHero(icon,"warn","!",`${warnCount} warning${warnCount>1?"s":""}`,"Minor issues to review"); }
     else{ setHero(icon,"ok","✓","All systems healthy",`${services.length} service${services.length!==1?"s":""} monitored`); }
@@ -1310,7 +1347,7 @@ function paint(){
   const nowErr = new Set();
   visibleServices().forEach(s=>{
     const active=(s.errors||[]).filter(e=>!dismissedMap[e.id]);
-    const dl = (s.level!=="ok"&&active.length===0)?"ok":s.level;
+    const dl = (s.level!=="ok"&&(s.errors||[]).length>0&&active.length===0)?"ok":s.level;
     if(dl==="error"||active.some(e=>e.level==="error")) nowErr.add(s.name);
   });
   if(!firstLoadAlertSeed){
@@ -1377,16 +1414,16 @@ function renderStats(d, container){
 
   // metric cards (only show ones we have data for)
   const cards=[];
-  if(d.movies!=null) cards.push(["Movies", Number(d.movies).toLocaleString()]);
-  if(d.episodes!=null) cards.push(["TV episodes", Number(d.episodes).toLocaleString()]);
-  if(d.torrents!=null) cards.push(["Active torrents", d.torrents]);
+  if(d.movies!=null) cards.push(["Movies (largest library)", Number(d.movies).toLocaleString()]);
+  if(d.episodes!=null) cards.push(["Episodes (largest library)", Number(d.episodes).toLocaleString()]);
+  if(d.torrents!=null) cards.push(["Active downloads", d.torrents]);
   // overall uptime = min across services (worst link), or average
   let up=null;
   if(d.uptime && Object.keys(d.uptime).length){
     const vals=Object.values(d.uptime); up=(vals.reduce((a,b)=>a+b,0)/vals.length);
   }
   const metricsHtml = cards.map(c=>`<div class="sm-card"><div class="sm-label">${esc(c[0])}</div><div class="sm-val">${esc(String(c[1]))}</div></div>`).join("")
-    + (up!=null?`<div class="sm-card"><div class="sm-label">30-day uptime</div><div class="sm-val good">${up.toFixed(1)}%</div></div>`:"");
+    + (up!=null?`<div class="sm-card"><div class="sm-label">Observed health · 30d</div><div class="sm-val good">${up.toFixed(1)}%</div></div>`:"");
 
   // when both media servers run, show their libraries broken out per server
   let perServerHtml="";
@@ -1408,7 +1445,7 @@ function renderStats(d, container){
     const multiSource = (np.sources||[]).length>1;
     const rows = streams.length ? streams.map((s,i)=>{
       const ic = s.type==="episode"?"ti-device-tv":"ti-movie";
-      const cacheBust = (s.title||"").length + (s.progress||0);
+      const cacheBust = (s.title||"").length + Number(s.progress||0);
       // when more than one server is feeding the list, tag each row with its source
       const srcTag = multiSource && s.source ? `<span class="np-src">${esc(s.source)}</span>` : "";
       const paused = s.paused ? " · paused" : "";
@@ -1569,7 +1606,7 @@ const HELP_TOPICS = {
       <p class="help-note">In short: point this at Readarr or a compatible fork and it should just work today, but treat ongoing support as best-effort, not guaranteed.</p>`
   },
   torrents_view: {
-    title: "Active torrents", sub: "What's downloading and seeding",
+    title: "Active downloads", sub: "What's downloading and seeding",
     body: `<p>Shows your current torrents in two tabs, downloading and seeding.</p>
       <p>If <b>qBittorrent</b> is set up, this reads from it directly with full detail (live speeds, ratio, ETA). If not, it falls back to the <b>Radarr/Sonarr download queue</b>, which works with any client (Transmission, Deluge, etc.) but shows active downloads only.</p>`
   }
@@ -1628,7 +1665,7 @@ async function checkUpdate(){
       notes.innerHTML=`<div class="nh">WHAT'S NEW</div><ul>${bullets.map(b=>`<li>${esc(b)}</li>`).join("")}</ul>`
         + (info.has_more?`<div class="more">See all on GitHub →</div>`:"");
     } else { notes.style.display="none"; notes.innerHTML=""; }
-    document.getElementById("updLink").href=info.url||"#";
+    document.getElementById("updLink").href=safeHttpUrl(info.url)||"#";
     card.style.display="block";
   }catch(e){ /* offline or check disabled, stay quiet */ }
 }
@@ -1652,26 +1689,25 @@ async function restore(id){ await fetch("/api/restore",{method:"POST",headers:{"
 
 /* ---------- one-click remediation ---------- */
 async function runAction(issueId, idx){
-  const list=issueActionsMap[issueId]||[];
-  const a=list[idx]; if(!a) return;
-  // destructive actions (remove/blocklist) confirm first; the backend supplies
-  // a cause-aware message (e.g. warning that this won't fix a stalled torrent)
-  if(a.destructive){
-    const msg = a.confirm || `${a.label}?\n\nThis removes the download and blocklists the release so it won't be grabbed again.`;
-    if(!confirm(msg)) return;
-  }
-  toast(`${a.label}…`);
-  try{
-    const r=await (await fetch("/api/action",{method:"POST",headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({service:a.service, action:a.action, params:a.params})})).json();
-    toast(r.ok ? (r.message||"Done.") : ("Failed: "+(r.error||"unknown error")));
-    setTimeout(refresh, 900);   // re-poll so a resolved issue clears
-  }catch(e){ toast("Action failed."); }
+  const a=(issueActionsMap[issueId]||[])[idx]; if(!a) return;
+  if(a.destructive && !confirm(a.confirm||"Delete this download, blocklist it, and search again?")) return;
+  const key=issueId+":"+idx;
+  if(runningActions.has(key)) return;
+  runningActions.add(key);
+  const buttons=[...document.querySelectorAll("button")].filter(b=>b.getAttribute("onclick")===`runAction('${issueId}',${idx})`);
+  buttons.forEach(b=>{b.disabled=true;b.textContent="Running…";});
+  try {
+    const r=await (await fetch("/api/action",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({service:a.service,action:a.action,params:a.params})})).json();
+    toast(r.ok ? r.message||"Succeeded" : (r.partial?"Partially completed: ":"Failed: ")+(r.error||"Unknown error"));
+    refresh();
+  } catch(e){ toast("Connection lost. Check action history before retrying."); }
+  finally { runningActions.delete(key);buttons.forEach(b=>{b.disabled=false;b.textContent=a.label;}); }
 }
 async function restoreAll(){ await fetch("/api/restore",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id:"__all__"})}); refresh(); }
 
 /* ---------- manual refresh ---------- */
 async function manualRefresh(){
+  if(GT_PUBLIC){ await refresh(); return; }
   const b=document.getElementById("refreshBtn"); b.classList.add("spin"); setTimeout(()=>b.classList.remove("spin"),800);
   await fetch("/api/refresh",{method:"POST"}); setTimeout(refresh,600);
 }
@@ -1787,7 +1823,11 @@ function renderNotifSettings(){
   document.getElementById("pushoverEnabled").checked = !!n.pushover_enabled;
   document.getElementById("pushoverToken").value = n.pushover_token || "";
   document.getElementById("pushoverUser").value = n.pushover_user || "";
+  document.getElementById("telegramEnabled").checked = !!n.telegram_enabled;
+  document.getElementById("telegramToken").value = n.telegram_token || "";
+  document.getElementById("telegramChat").value = n.telegram_chat || "";
   document.getElementById("notifRecovery").checked = n.notify_recovery !== false;
+  document.getElementById("notifDependency").checked = n.dependency_aware !== false;
   document.getElementById("quietEnabled").checked = !!n.quiet_enabled;
   document.getElementById("quietStart").value = n.quiet_start || "23:00";
   document.getElementById("quietEnd").value = n.quiet_end || "07:00";
@@ -1810,6 +1850,7 @@ function renderNotifSettings(){
   document.getElementById("ntfyEnabled").onchange = syncNotifFieldsState;
   document.getElementById("discordEnabled").onchange = syncNotifFieldsState;
   document.getElementById("pushoverEnabled").onchange = syncNotifFieldsState;
+  document.getElementById("telegramEnabled").onchange = syncNotifFieldsState;
 }
 function syncNotifFieldsState(){
   const hide=(id,cond)=>document.getElementById(id).classList.toggle("hidden",cond);
@@ -1818,6 +1859,7 @@ function syncNotifFieldsState(){
   hide("ntfyFields", !document.getElementById("ntfyEnabled").checked);
   hide("discordFields", !document.getElementById("discordEnabled").checked);
   hide("pushoverFields", !document.getElementById("pushoverEnabled").checked);
+  hide("telegramFields", !document.getElementById("telegramEnabled").checked);
 }
 function setNotifSeverity(s){
   notifSeverity=s;
@@ -1854,10 +1896,16 @@ async function testNotify(){
 
 function renderServiceGroups(focus){
   const box=document.getElementById("serviceGroups"); box.innerHTML="";
+  const appSelect=document.getElementById("instanceApp");
+  const selectedApp=appSelect.value;
+  appSelect.innerHTML=serviceCatalog.filter(c=>c.service===c.app).map(c=>`<option value="${esc(c.app)}">${esc(c.app)}</option>`).join("");
+  if(selectedApp) appSelect.value=selectedApp;
   // services we want to flag as beta/limited when they're being set up
   const BETA_NOTE={
     jellyfin: "Beta: Jellyfin support is limited to monitoring and live stats (now-playing). Search, requests, and other features aren't available yet.",
-    tunarr: "Beta: covers reachability and Tunarr's own health checks (ffmpeg, hardware acceleration, etc.). Channels and stats aren't surfaced yet."
+    tunarr: "Beta: covers reachability and Tunarr's own health checks (ffmpeg, hardware acceleration, etc.). Channels and stats aren't surfaced yet.",
+    sabnzbd: "Beta: monitoring only (reachability, API key, and a paused-queue warning). The download queue isn't surfaced yet.",
+    nzbget: "Beta: monitoring only (reachability, login, and a paused-queue warning). The download queue isn't surfaced yet."
   };
   // per-service ⓘ info popups (keyed by instance name) -> a HELP_TOPICS key
   const SERVICE_HELP={ readarr: "readarr_forks" };
@@ -1877,17 +1925,17 @@ function renderServiceGroups(focus){
   // everyone actually watches), then the download client, then the *arr managers,
   // then the request portals. Ordered by service TYPE so instances within a type
   // (the five *arr apps) keep their natural order; unknown/new types fall to the end.
-  const TYPE_ORDER={plex:0, jellyfin:1, qbit:2, arr:3, ombi:4, seerr:5};
+  const TYPE_ORDER={plex:0, jellyfin:1, qbit:2, sabnzbd:3, nzbget:4, arr:5, ombi:6, seerr:7, tunarr:8};
   const typeRank=t=>(t in TYPE_ORDER ? TYPE_ORDER[t] : 99);
   const orderedServices=Object.entries(fullConfig.services)
     .sort((a,b)=>typeRank(a[1].type)-typeRank(b[1].type));
   for(const [name,svc] of orderedServices){
-    const req=fieldsFor(name, svc);
+    const req=["label", ...fieldsFor(name, svc), ...(svc.type==="docker"?["containers"]:[])];
     const fields=req.map(f=>{
       const val=esc(svc[f]||"");
-      const type=f==="password"?"password":"text";
-      return `<div class="field"><label>${FIELD_LABELS[f]||f}</label>
-        <input data-svc="${name}" data-field="${f}" type="${type}" value="${val}" placeholder="${FIELD_LABELS[f]||f}"></div>`;
+      const type=["password","api_key","token"].includes(f)?"password":"text";
+      return `<div class="field"><label for="field-${name}-${f}">${FIELD_LABELS[f]||f}</label>
+        <input id="field-${name}-${f}" data-svc="${name}" data-field="${f}" type="${type}" value="${val}" placeholder="${FIELD_LABELS[f]||f}"></div>`;
     }).join("");
     const note = BETA_NOTE[svc.type] ? `<div class="beta-note">${esc(BETA_NOTE[svc.type])}</div>` : "";
     const betaTag = BETA_NOTE[svc.type] ? ` <span class="beta-tag">beta</span>` : "";
@@ -1897,14 +1945,14 @@ function renderServiceGroups(focus){
     box.insertAdjacentHTML("beforeend",`
       <div class="group">
         <div class="group-h">
-          <span class="gname">${name}${betaTag}${infoBtn}</span>
+          <span class="gname">${esc(svc.label||name)}${betaTag}${infoBtn}</span>
           <button class="btn" style="padding:6px 12px" onclick="toggleGroup('${name}')">Edit</button>
         </div>
         <div class="toggle-line">
           <div><div class="tl-text">Enable this service</div><div class="tl-sub">Off = not monitored, hidden, and never prompted</div></div>
           <label class="switch"><input type="checkbox" data-svc="${name}" data-flag="active" ${svc.disabled?"":"checked"}><span class="track"></span></label>
         </div>
-        <div class="group-fields ${open?"":"collapsed"}" id="gf-${name}">${note}${fields}</div>
+        <div class="group-fields ${open?"":"collapsed"}" id="gf-${name}">${note}${fields}<button class="btn" onclick="testService('${name}', this)">Test connection</button> ${name!==svc.app?`<button class="btn" onclick="removeInstance('${name}')">Remove instance</button>`:""}<div id="test-${name}" role="status"></div></div>
       </div>`);
   }
 }
@@ -1935,8 +1983,12 @@ function collectSettings(){
     pushover_enabled: document.getElementById("pushoverEnabled").checked,
     pushover_token: document.getElementById("pushoverToken").value.trim(),
     pushover_user: document.getElementById("pushoverUser").value.trim(),
+    telegram_enabled: document.getElementById("telegramEnabled").checked,
+    telegram_token: document.getElementById("telegramToken").value.trim(),
+    telegram_chat: document.getElementById("telegramChat").value.trim(),
     severity: notifSeverity,
     notify_recovery: document.getElementById("notifRecovery").checked,
+    dependency_aware: document.getElementById("notifDependency").checked,
     ignore_services: ignore,
     quiet_enabled: document.getElementById("quietEnabled").checked,
     quiet_start: document.getElementById("quietStart").value || "23:00",
@@ -2050,8 +2102,8 @@ function onboardToStep2(){
     const fields=s.fields.map(f=>{
       const val=esc((serviceMeta[s.service]&&f==="url")?(serviceMeta[s.service].url||s.url||""):(s.url&&f==="url"?s.url:""));
       const hint=f==="url"?"Server address, e.g. http://192.168.1.50:7878":(FIELD_LABELS[f]||f);
-      return `<div class="field"><label>${FIELD_LABELS[f]||f}</label>
-        <input data-svc="${s.service}" data-field="${f}" type="${f==="password"?"password":"text"}" value="${val}" placeholder="${hint}"></div>`;
+      return `<div class="field"><label for="field-${name}-${f}">${FIELD_LABELS[f]||f}</label>
+        <input id="field-${name}-${f}" data-svc="${s.service}" data-field="${f}" type="${f==="password"?"password":"text"}" value="${val}" placeholder="${hint}"></div>`;
     }).join("");
     const ONBOARD_BETA = {
       jellyfin: "Beta: Jellyfin support is limited to monitoring and live stats (now-playing) for now.",
@@ -2120,8 +2172,8 @@ function renderHistory(data){
     html += `<div class="hist-cards">` + names.map(n=>{
       const c=counts[n]||{day:0,week:0,month:0};
       const up=uptime[n];
-      // 30-day uptime: label + % on one line, thin coloured bar under it (same footprint)
-      const upHtml = (up!=null) ? `<div class="hc-up"><span>30-day uptime</span><b>${up.toFixed(1)}%</b></div>
+      // Observed health · 30d: label + % on one line, thin coloured bar under it (same footprint)
+      const upHtml = (up!=null) ? `<div class="hc-up"><span>Observed health · 30d</span><b>${up.toFixed(1)}%</b></div>
         <div class="hc-upbar"><span style="width:${Math.max(0,Math.min(100,up))}%;background:${uptimeColor(up)}"></span></div>` : "";
       return `<div class="hist-card"><div class="hc-name">${esc(n)}</div>${upHtml}
         <div class="hc-row"><span>Down · 24h</span><b>${c.day}</b></div>
@@ -2149,6 +2201,8 @@ function renderHistory(data){
           onclick="const m=document.getElementById('histMore'); const open=m.classList.toggle('show'); this.textContent= open?'Show fewer':'Show ${rest.length} more';">Show ${rest.length} more</button>`;
     }
   }
+  const actions=data.actions||[];
+  html+='<div class="hist-h">Action history</div>'+ (actions.length?actions.map(a=>`<div class="hist-ev"><div class="he-body"><b>${esc(a.service)} · ${esc(a.action)}</b><div>${esc(a.status)}${a.automatic?" · automatic":""} · ${esc(a.message||"")}</div><div class="he-time">${esc(new Date(a.ts*1000).toLocaleString())}</div></div></div>`).join(""):'<p>No actions recorded yet.</p>');
   body.innerHTML=html;
 }
 
@@ -2161,7 +2215,7 @@ function toggleSearch(){
   if(searchOpen){ setTimeout(()=>document.getElementById("searchInput").focus(),300); }
   else { document.getElementById("searchInput").value=""; document.getElementById("searchResults").innerHTML=""; }
 }
-function setKind(k){ searchKind=k;
+function setKind(k){ searchKind=k; syncSearchInstances();
   // highlight whichever kind button is active
   document.querySelectorAll(".kind-seg button").forEach(b=>b.classList.toggle("active", b.dataset.kind===k));
   if(document.getElementById("searchInput").value.trim()) runSearch();
@@ -2181,7 +2235,7 @@ function syncSearchKinds(){
   const names={movie:"movies",series:"shows",book:"books",music:"music"};
   const avail=searchKinds.map(k=>names[k]||k);
   const inp=document.getElementById("searchInput");
-  if(inp) inp.placeholder = avail.length ? `Search ${avail.join(", ")} to add…` : "Search to add…";
+  if(inp) inp.placeholder = avail.length ? `Search ${avail.join(", ")}…` : "Search to add…";
 }
 document.getElementById("searchInput").addEventListener("input",()=>{ clearTimeout(searchTimer); searchTimer=setTimeout(runSearch,450); });
 
@@ -2216,71 +2270,39 @@ async function loadTorrents(){
   try{
     const r=await (await fetch("/api/torrents",{method:"POST"})).json();
     if(!r.ok){ document.getElementById("torrentsList").innerHTML=`<div class="tor-empty">${esc(r.error||"Couldn't load torrents")}</div>`; return; }
-    torrentData={downloading:r.downloading||[],seeding:r.seeding||[]};
+    torrentData={downloading:r.downloading||[],seeding:r.seeding||[],errors:r.errors||[]};
     torrentSource=r.source||"qbittorrent";
     renderTorrents();
   }catch(e){ document.getElementById("torrentsList").innerHTML=`<div class="tor-empty">Couldn't load torrents.</div>`; }
 }
 function renderTorrents(){
-  const box=document.getElementById("torrentsList");
-  const fallback = torrentSource==="arr_queue";
-
-  // In fallback mode the *arr queue has no seeding data
-  if(fallback && torrentTab==="seeding"){
-    box.innerHTML=`<div class="tor-empty">Seeding isn't available without qBittorrent.<br>
-      Showing the Radarr/Sonarr download queue, which only tracks active downloads.</div>`;
-    return;
-  }
-
-  const list=torrentData[torrentTab]||[];
-  const notice = fallback
-    ? `<div class="tor-notice">qBittorrent not configured; showing the Radarr/Sonarr download queue.</div>` : "";
-  if(!list.length){ box.innerHTML=notice+`<div class="tor-empty">No ${torrentTab} torrents.</div>`; return; }
-
-  box.innerHTML=notice+'<div class="tor-list">'+list.map(t=>{
-    const done=t.progress>=100;
-    let stats;
-    if(torrentTab==="downloading"){
-      if(fallback){
-        // queue mode: no live speed, but show progress, size and the real client
-        stats = `<span><b>${t.progress}%</b></span>
-                 <span>${fmtBytes(t.size)}</span>
-                 ${t.client?`<span>via <b>${esc(t.client)}</b></span>`:""}
-                 ${t.app?`<span>${esc(t.app)}</span>`:""}`;
-      }else{
-        stats = `<span><b>${t.progress}%</b></span>
-                 <span>↓ <b>${fmtBytes(t.dlspeed)}/s</b></span>
-                 <span>${fmtBytes(t.size)}</span>
-                 <span>ETA ${fmtEta(t.eta)}</span>
-                 <span>${t.seeds} seeds</span>`;
-      }
-    }else{
-      stats = `<span>↑ <b>${fmtBytes(t.upspeed)}/s</b></span>
-               <span>Ratio <b>${t.ratio}</b></span>
-               <span>${fmtBytes(t.size)}</span>
-               <span>${t.peers} peers</span>`;
-    }
-    return `<div class="tor">
-      <div class="tor-name">${esc(t.name)}</div>
-      <div class="tor-bar ${done?"done":""}"><span style="width:${Math.min(100,t.progress)}%"></span></div>
-      <div class="tor-stats">${stats}</div></div>`;
-  }).join("")+'</div>';
+  const box=document.getElementById("torrentsList"), rows=torrentData[torrentTab]||[];
+  const errors=(torrentData.errors||[]).map(e=>`<div class="tor-notice">${esc(e)}</div>`).join("");
+  box.innerHTML=errors+(rows.length?'<div class="tor-list">'+rows.map(t=>`<div class="tor">
+    <div class="tor-name">${esc(t.name)}</div><div class="tor-stats">${esc(t.client||t.app||"")} · ${esc(t.state||"")}</div>
+    <div class="tor-bar"><span style="width:${Math.max(0,Math.min(100,Number(t.progress)||0))}%"></span></div>
+    <div class="tor-stats"><span>${Number(t.progress||0).toFixed(1)}%</span><span>${fmtBytes(t.size)}</span>
+    <span>↓ ${fmtBytes(t.dlspeed)}/s</span><span>ETA ${fmtEta(t.eta)}</span>
+    ${t.protocol==="torrent"?`<span>${t.seeds||0} seeds · ratio ${t.ratio||0}</span>`:""}</div></div>`).join("")+'</div>':
+    `<div class="tor-empty">No ${torrentTab==="seeding"?"seeding torrents":"active downloads"}.</div>`);
 }
 
 async function runSearch(){
+  const generation=++searchGeneration;
   const term=document.getElementById("searchInput").value.trim();
   const box=document.getElementById("searchResults");
   if(!term){ box.innerHTML=""; return; }
   box.innerHTML=`<div class="search-status">Searching…</div>`;
   try{
     const r=await (await fetch("/api/search",{method:"POST",headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({kind:searchKind,term})})).json();
+      body:JSON.stringify({kind:searchKind,term,service:document.getElementById("searchInstance").value})})).json();
+    if(generation!==searchGeneration) return;
     if(!r.ok){ box.innerHTML=`<div class="search-status">${esc(r.error||"Search failed")}</div>`; return; }
     if(!r.results.length){ box.innerHTML=`<div class="search-status">No results for “${esc(term)}”.</div>`; return; }
     box.innerHTML='<div class="results">'+r.results.map((m,i)=>{
       window._results=r.results;
       const icon={movie:"🎬",series:"📺",book:"📚",music:"🎵"}[searchKind]||"🔍";
-      const img=m.poster?`<div class="img" style="background-image:url('${esc(m.poster)}')"></div>`:`<div class="img ph">${icon}</div>`;
+      const img=safeHttpUrl(m.poster)?`<img class="img" src="${esc(safeHttpUrl(m.poster))}" alt="" loading="lazy" referrerpolicy="no-referrer">`:`<div class="img ph">${icon}</div>`;
       const tag=m.already?`<span class="tag">In library</span>`:"";
       return `<div class="poster" id="poster-${i}" onclick="addMedia(${i})">${img}${tag}
         <div class="meta"><div class="pt">${esc(m.title)}</div><div class="py">${esc(String(m.year||""))}</div></div></div>`;
@@ -2300,12 +2322,12 @@ async function addMedia(i){
     toast(`Found “${item.title}”. Add it from ${searchKind==="book"?"Readarr":"Lidarr"} directly for now.`);
     return;
   }
-  pendingAdd = { i, item };
+  pendingAdd = { i, item, kind:searchKind, service:document.getElementById("searchInstance").value };
 
   // fill the confirm modal
   document.getElementById("confirmTitle").textContent = `Add “${item.title}”?`;
   document.getElementById("confirmSub").textContent =
-    `${item.year||""} · will be added to ${searchKind==="movie"?"Radarr":"Sonarr"} and a download search started.`;
+    `${item.year||""} · will be added to ${(searchInstances.find(s=>s.service===pendingAdd.service)||{}).label||pendingAdd.service} and a download search started.`;
   const sel=document.getElementById("profileSelect");
   sel.innerHTML=`<option>Loading profiles…</option>`; sel.disabled=true;
   document.getElementById("confirmAddBtn").disabled=true;
@@ -2314,14 +2336,17 @@ async function addMedia(i){
   // load quality profiles + remembered default
   try{
     const r=await (await fetch("/api/profiles",{method:"POST",headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({kind:searchKind})})).json();
+      body:JSON.stringify({kind:pendingAdd.kind,service:pendingAdd.service})})).json();
     if(!r.ok || !r.profiles.length){
       sel.innerHTML=`<option value="">${esc(r.error||"No profiles found")}</option>`;
       return;
     }
+    const roots=document.getElementById("rootSelect");
+    roots.innerHTML=(r.roots||[]).map(root=>`<option value="${Number(root.id)}">${esc(root.path||("Root folder "+root.id))}</option>`).join("");
+    if(!r.roots?.length){ sel.innerHTML="<option>No root folder configured</option>"; return; }
     const def = r.default;  // remembered choice (may be null)
     sel.innerHTML = r.profiles.map(p=>
-      `<option value="${p.id}" ${p.id===def?"selected":""}>${esc(p.name)}</option>`).join("");
+      `<option value="${Number(p.id)}" ${p.id===def?"selected":""}>${esc(p.name)}</option>`).join("");
     // if no remembered default, leave first selected (browser default)
     sel.disabled=false;
     document.getElementById("confirmAddBtn").disabled=false;
@@ -2332,21 +2357,81 @@ function closeConfirm(){ document.getElementById("confirmOverlay").classList.rem
 
 async function confirmAdd(){
   if(!pendingAdd) return;
-  const { i, item } = pendingAdd;
-  const sel=document.getElementById("profileSelect");
-  const profileId = sel.value ? parseInt(sel.value) : null;
+  const request = {...pendingAdd};
   const btn=document.getElementById("confirmAddBtn");
   btn.disabled=true; btn.textContent="Adding…";
-  const r=await (await fetch("/api/add",{method:"POST",headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({kind:searchKind,item,profile_id:profileId})})).json();
-  btn.disabled=false; btn.textContent="Add";
-  closeConfirm();
-  if(r.ok){
-    const card=document.getElementById("poster-"+i);
-    if(card){ card.classList.add("added"); card.insertAdjacentHTML("beforeend",`<span class="tag">Added ✓</span>`); }
-    toast(`Added ${item.title}, searching for downloads`);
-  } else toast("Couldn't add: "+(r.error||""));
+  try {
+    const response=await fetch("/api/add",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({
+      kind:request.kind, service:request.service, item:request.item,
+      profile_id:Number(document.getElementById("profileSelect").value), root_folder_id:Number(document.getElementById("rootSelect").value)})});
+    const r=await response.json();
+    if(!r.ok){ toast("Couldn't add: "+r.error); return; }
+    closeConfirm();
+    toast(`Added ${request.item.title}; download search started.`);
+    runSearch();
+  } catch(e){ toast("Couldn't reach GuardTowarr. Check the library before retrying."); }
+  finally { btn.disabled=false; btn.textContent="Add"; }
 }
+
+
+function syncSearchInstances(){
+  const select=document.getElementById("searchInstance"), old=select.value;
+  const choices=searchInstances.filter(s=>s.kind===searchKind);
+  select.innerHTML=choices.map(s=>`<option value="${esc(s.service)}">${esc(s.label)}</option>`).join("");
+  if(choices.some(s=>s.service===old)) select.value=old;
+  document.getElementById("searchInput").title=["book","music"].includes(searchKind)?"Search only; add in Readarr or Lidarr":"Search and add to the selected instance";
+}
+function addInstance(){
+  collectSettings();
+  const app=document.getElementById("instanceApp").value;
+  const template=fullConfig.services[app]; if(!template) return;
+  let number=2; while(fullConfig.services[app+"_"+number]) number++;
+  const name=app+"_"+number;
+  const fresh={...template,app,label:(template.label||app)+" "+number,disabled:false,hidden:false};
+  for(const key of ["api_key","password","username","token"]) if(key in fresh) fresh[key]="";
+  fullConfig.services[name]=fresh;
+  renderServiceGroups(name);
+  document.getElementById("gf-"+name).scrollIntoView({block:"nearest"});
+}
+function removeInstance(name){
+  if(!confirm("Remove this instance from GuardTowarr? The service and its media are not changed.")) return;
+  collectSettings(); delete fullConfig.services[name]; renderServiceGroups();
+}
+async function testService(name,button){
+  collectSettings(); button.disabled=true;
+  const target=document.getElementById("test-"+name); target.textContent="Testing…";
+  try {
+    const r=await (await fetch("/api/test-service",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({service:name,config:fullConfig.services[name]})})).json();
+    target.textContent=r.result ? r.result.summary+(r.result.errors?.length?" — "+r.result.errors.map(e=>e.message).join("; "):"") : r.error;
+  } catch(e){ target.textContent="Connection test could not complete. Check GuardTowarr is running."; }
+  finally {button.disabled=false;}
+}
+
+// Make every modal keyboard reachable, trap focus, and restore it on close.
+const modalFocus=new WeakMap();
+for(const overlay of document.querySelectorAll(".overlay")){
+  const modal=overlay.querySelector(".modal")||overlay;
+  modal.setAttribute("role","dialog"); modal.setAttribute("aria-modal","true"); modal.tabIndex=-1;
+  const heading=modal.querySelector("h2"); if(heading){if(!heading.id)heading.id=overlay.id+"Title";modal.setAttribute("aria-labelledby",heading.id);}
+  let shown=overlay.classList.contains("show");
+  new MutationObserver(()=>{
+    const next=overlay.classList.contains("show"); if(next===shown)return; shown=next;
+    if(next){modalFocus.set(overlay,document.activeElement); (modal.querySelector("input,select,button,[tabindex='0']")||modal).focus();}
+    else {const previous=modalFocus.get(overlay);if(previous?.isConnected)previous.focus();}
+  }).observe(overlay,{attributes:true,attributeFilter:["class"]});
+  modal.addEventListener("keydown",e=>{
+    if(e.key!=="Tab")return;
+    const items=[...modal.querySelectorAll("button,input,select,a[href],[tabindex='0']")].filter(el=>!el.disabled&&el.getClientRects().length);
+    if(!items.length){e.preventDefault();modal.focus();return;}
+    const first=items[0],last=items[items.length-1];
+    if(e.shiftKey&&(document.activeElement===first||document.activeElement===modal)){e.preventDefault();last.focus();}
+    else if(!e.shiftKey&&document.activeElement===last){e.preventDefault();first.focus();}
+  });
+}
+for(const button of document.querySelectorAll("button")){
+  if(!button.getAttribute("aria-label")&&(button.title||button.textContent.trim()==="✕"))button.setAttribute("aria-label",button.title||"Close");
+}
+window.addEventListener("unhandledrejection",()=>toast("Request failed. Your changes may not have been saved; check the connection and retry."));
 
 /* close overlays on backdrop click / Esc */
 ["settingsOverlay","onboardOverlay","confirmOverlay","historyOverlay","statsOverlay","helpOverlay"].forEach(id=>{

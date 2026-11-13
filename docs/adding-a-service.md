@@ -63,6 +63,12 @@ Find `SERVICE_REGISTRY` in `monitor.py` and add a block:
 Restart the app. The service then appears in setup, gets a config entry, prompts
 for its credentials, and is polled on the normal schedule.
 
+In 2.0, `name` is an instance ID and may be user-created (for example,
+`radarr_4k`). Use `service_app(name, cfg)` to identify its application and
+`cfg.get("label", name)` for display. Iterate with `active_instances` rather than
+assuming a single default ID exists. Any mutation must retain the selected
+instance ID through validation and execution.
+
 ## Capabilities
 
 Every service supports `"monitor"` automatically. That is the uptime/health check
