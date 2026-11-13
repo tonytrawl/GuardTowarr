@@ -34,7 +34,7 @@ of a headache.
 - Remote responses filter nested credentials, internal addresses, and paths.
   Links are limited to HTTP(S), poster responses to supported image formats, and
   service requests won't carry credentials across redirects to another host.
-- Cross-site writes and page framing are blocked. The existing Chart.js download
+- Cross-site writes, admin-port DNS rebinding, and page framing are blocked. The existing Chart.js download
   is integrity-pinned. The main port is still for a trusted LAN; remote access
   still needs an HTTPS reverse proxy.
 - Stable Docker releases publish the version tag and `latest` together.

@@ -17,6 +17,9 @@ worth knowing before you report them:
 
 - The **main dashboard (port 9595) has no login** and shows full config including
   credentials. It is designed for a trusted LAN. Do not expose it to the internet.
+  Open it by server IP, `localhost`, or the machine hostname. Arbitrary DNS names
+  are rejected to protect against DNS rebinding. Use the token-protected remote
+  port for a reverse-proxy domain.
 - The optional **remote-access port** is the only part meant to be reachable from
   outside. It strips credentials and internal addresses, requires a token, and is
   intended to sit behind an HTTPS reverse proxy with its own authentication. It

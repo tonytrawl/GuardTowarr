@@ -326,6 +326,15 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(self.request(base,'/api/config',[])[0],400)
         self.assertEqual(self.request(base,'/api/refresh',{}, {'Origin':'https://evil.invalid'})[0],403)
 
+    def test_admin_rejects_dns_rebinding_host(self):
+        base=self.server(False)
+        code, _ = self.request(base,'/api/config',headers={'Host':'attacker.example'})
+        self.assertEqual(code,403)
+        self.assertEqual(self.request(base,'/api/config')[0],200)
+        m.CONFIG['public'].update(enabled=True,token='remote-secret')
+        public=self.server(True)
+        self.assertEqual(self.request(public,'/api/status',headers={'Host':'remote.example','X-GT-Token':'remote-secret'})[0],200)
+
     def test_cross_origin_redirect_rejected(self):
         req=urllib.request.Request('http://service.test/api',headers={'X-Api-Key':'secret'})
         handler=m.SameOriginRedirect()

@@ -31,6 +31,7 @@ import tempfile
 import shutil
 import socket
 import http.client
+import ipaddress
 import threading
 import concurrent.futures
 import http.server
@@ -3321,7 +3322,29 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return True if self._public_token_ok() else self._deny(401, "Token required.")
         return self._deny(404)
 
+    def _admin_host_ok(self):
+        # The unauthenticated LAN port must not answer for attacker-controlled
+        # DNS names. Otherwise DNS rebinding can turn a website into a LAN client.
+        if self._is_public():
+            return True
+        try:
+            host = urllib.parse.urlsplit("http://" + self.headers.get("Host", "")).hostname
+            if not host:
+                raise ValueError()
+            try:
+                ipaddress.ip_address(host)
+                return True
+            except ValueError:
+                pass
+            if host.lower().rstrip(".") in {"localhost", socket.gethostname().lower(), socket.getfqdn().lower()}:
+                return True
+            raise ValueError()
+        except ValueError:
+            return self._deny(403, "Use the server IP address or local hostname for the admin dashboard.")
+
     def do_GET(self):
+        if not self._admin_host_ok():
+            return
         if self._is_public() and not self._public_get_ok():
             return
         self.path = urllib.parse.urlsplit(self.path).path + ("?" + urllib.parse.urlsplit(self.path).query if self.path.startswith("/api/poster?") else "")
@@ -3499,6 +3522,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(page.encode())
 
     def do_POST(self):
+        if not self._admin_host_ok():
+            return
         # Authenticate before reading a potentially slow or oversized body.
         if self._is_public() and not self._public_token_ok():
             return self._deny(401, "Token required.")
