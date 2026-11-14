@@ -129,10 +129,17 @@
   /* search results grid */
   .results{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,150px),1fr));
     gap:clamp(12px,2.4vw,18px);animation:rise .4s var(--ease) both}
-  .poster{background:var(--card);border:.5px solid var(--card-border);border-radius:var(--radius-sm);
+  .poster{min-width:0;align-self:start;background:var(--card);border:.5px solid var(--card-border);border-radius:var(--radius-sm);
     overflow:hidden;box-shadow:var(--shadow);cursor:pointer;transition:transform .35s var(--ease);position:relative}
   @media(hover:hover){.poster:hover{transform:translateY(-4px) scale(1.02)}}
-  .poster .img{aspect-ratio:2/3;background:var(--fill) center/cover no-repeat;display:grid;place-items:center}
+  .poster-art{position:relative;width:100%;aspect-ratio:2/3;overflow:hidden;background:var(--fill)}
+  .poster .img{position:absolute;inset:0;display:block;width:100%;height:100%;min-width:0;max-width:100%;object-fit:cover}
+  .poster .img.ph{display:grid;place-items:center}
+  .shortcut-panel{margin:18px 0;padding:18px;border:1px solid var(--card-border);border-radius:var(--radius-sm);background:var(--card)}
+  .shortcut-panel h3{margin:0 0 12px;font-size:15px}
+  .shortcut-links{display:flex;flex-wrap:wrap;gap:10px}
+  .shortcut-links a{max-width:100%;overflow-wrap:anywhere;text-decoration:none}
+  .shortcut-editor{padding:12px 0;border-bottom:1px solid var(--card-border)}
   .poster .img.ph{color:var(--text-2);font-size:30px}
   .poster .meta{padding:10px 11px}
   .poster .pt{font-size:13.5px;font-weight:600;letter-spacing:-.01em;line-height:1.3;
@@ -273,7 +280,7 @@
   .switch input:checked + .track:before{transform:translateX(20px)}
   .toggle-line{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:8px 0}
   .toggle-line .tl-text{font-size:14px}
-  .toggle-line .tl-sub{font-size:12px;color:var(--text-2)}
+  .toggle-line .tl-sub,.settings-modal .tl-sub{font-size:12px;color:var(--text-2);line-height:1.5;overflow-wrap:anywhere}
   .modal-actions{display:flex;gap:10px;margin-top:20px}
   .modal-actions .btn{flex:1;text-align:center;padding:12px}
   .seg-theme{display:inline-flex;background:var(--fill);border-radius:11px;padding:3px;gap:2px;width:100%}
@@ -623,6 +630,7 @@
       </div>
     </div>
     <!-- inline stats (shown under the all-clear hero when healthy) -->
+    <section id="shortcutPanel" class="shortcut-panel" aria-label="Services and shortcuts" hidden></section>
     <div id="inlineStats" style="display:none"></div>
 
     <div class="toolbar" id="mainToolbar">
@@ -677,6 +685,26 @@
           <input id="portInput" type="number" min="1" max="65535" step="1" value="9595">
           <div class="tl-sub" style="margin-top:5px;font-size:11px;line-height:1.4;opacity:.8">Default 9595. Changing this needs a restart. (Ignored in Docker; set the port in your compose file.)</div>
         </div>
+      </div>
+
+      <div class="set-section">
+        <h3>Reverse proxy access</h3>
+        <div class="field"><label for="allowedHosts">Allowed dashboard domains</label>
+          <input id="allowedHosts" placeholder="dashboard.example.com, guardtowarr.home">
+          <div class="tl-sub">Enter exact domains or paste HTTP(S) URLs; only the hostname is saved. Wildcards are not allowed. This allows your proxy domain; it does not add a login. Protect the admin proxy with authentication. If locked out, set GUARDTOWARR_ALLOWED_HOSTS in the container environment.</div>
+        </div>
+      </div>
+      <div class="set-section">
+        <h3>Storage</h3>
+        <div class="field"><label for="storageMode">Storage display</label><select id="storageMode" onchange="syncStorageMode()"><option value="all">All instances</option><option value="selected">Selected instances</option><option value="off">Off</option></select></div>
+        <div class="field"><label for="storageInstances">Storage sources</label><select id="storageInstances" multiple size="4" onchange="syncStorageMode()"></select><div id="storageEmpty" class="tl-sub" hidden>No storage sources selected.</div>
+          <div class="tl-sub">Choose one source if instances share the same disks. Off hides storage and stops disk lookups. Selected instances never falls back to all sources.</div></div>
+      </div>
+      <div class="set-section">
+        <h3>Services &amp; shortcuts</h3>
+        <div class="toggle-line"><label for="showShortcuts">Show the shortcuts panel</label><label class="switch"><input type="checkbox" id="showShortcuts"><span class="track"></span></label></div>
+        <p class="tl-sub">Enabled services use their monitoring address unless you set a Browser URL in Services. Custom shortcuts below can point to other apps. Remote links must be explicitly enabled and are visible to token holders.</p>
+        <div id="shortcutEditors"></div><button class="btn" type="button" onclick="addShortcut()">Add shortcut</button>
       </div>
 
       <div class="set-section">
@@ -978,7 +1006,7 @@
   <div class="modal" style="max-width:540px">
     <div class="mhead"><div><h2>Before you enable remote access</h2><div class="msub">Please read this carefully</div></div></div>
     <div class="help-body">
-      <p>This opens a <b>second port</b> meant to be reached from outside your network. It serves a locked-down view: live service status and (optionally) content requests. It <b>never</b> exposes your API keys, passwords, or internal addresses.</p>
+      <p>This opens a <b>second port</b> meant to be reached from outside your network. It serves a locked-down view: live service status and (optionally) content requests. It <b>never</b> exposes your API keys or passwords. Browser links are shared only when you explicitly enable them.</p>
       <ul>
         <li>It is protected only by the <b>access token</b> you set. That token is a shared secret, so anyone who has it can use the endpoint.</li>
         <li>The token is sent with each request, so on plain HTTP it could be intercepted. You should <b>serve it over HTTPS</b>.</li>
@@ -998,7 +1026,7 @@
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js" integrity="sha384-dug+JxfBvklEQdJ4AYuBBAIScUz0bVN73xpy273gcAwHjb3qI0fXmuYNaNfdyYJG" crossorigin="anonymous"></script>
 <script>
-const FIELD_LABELS = {label:"Display name", containers:"Container names (comma-separated; blank monitors all)", url:"Server URL", api_key:"API Key", token:"Plex Token", username:"Username", password:"Password"};
+const FIELD_LABELS = {label:"Display name", link_url:"Browser URL (optional)", containers:"Container names (comma-separated; blank monitors all)", url:"Server URL", api_key:"API Key", token:"Plex Token", username:"Username", password:"Password"};
 
 /* ---------- restricted public mode ----------
    The server injects window.GT_PUBLIC on the public port. In that mode every
@@ -1045,6 +1073,28 @@ function safeHttpUrl(value){
   try { const url=new URL(String(value)); return ["http:","https:"].includes(url.protocol)&&!url.username&&!url.password?url.href:""; }
   catch(e){ return ""; }
 }
+function displayServiceName(name){ return serviceMeta[name]?.label || name; }
+function renderShortcuts(links){
+  const panel=document.getElementById("shortcutPanel");
+  const valid=links.filter(link=>safeHttpUrl(link.shortcut_url));
+  panel.hidden=!valid.length;
+  panel.innerHTML=valid.length?'<h3>Services &amp; shortcuts</h3><div class="shortcut-links">'+valid.map(link=>`<a class="btn" href="${esc(safeHttpUrl(link.shortcut_url))}" target="_blank" rel="noopener noreferrer">${esc(link.label)} ↗</a>`).join("")+"</div>":"";
+}
+function renderShortcutEditors(){
+  document.getElementById("shortcutEditors").innerHTML=(fullConfig.shortcuts||[]).map((link,i)=>`<div class="shortcut-editor" data-shortcut="${i}">
+    <div class="field"><label for="shortcut-label-${i}">Name</label><input id="shortcut-label-${i}" data-link-field="label" value="${esc(link.label||"")}" maxlength="100"></div>
+    <div class="field"><label for="shortcut-url-${i}">URL</label><input id="shortcut-url-${i}" data-link-field="url" value="${esc(link.url||"")}" placeholder="https://app.example.com"></div>
+    <label><input type="checkbox" data-link-field="show_remote" ${link.show_remote?"checked":""}> Show this link in remote view</label><label><input type="checkbox" data-link-field="remote_override" onchange="confirmRemoteOverride(this)" ${link.remote_override?"checked":""}> Override remote link protection for this link</label><p class="tl-sub">Shares the full URL, including any tokens or other secrets it contains. Remote visibility must also be enabled.</p>
+    <button class="btn" type="button" onclick="removeShortcut(${i})">Remove shortcut</button></div>`).join("");
+}
+function confirmRemoteOverride(input){
+  if(input.checked&&!confirm("Share this URL exactly as entered? Query strings, fragments, or credentials in the URL may grant access to another app. Anyone with remote dashboard access can copy the full link, and it may appear in browser history or server logs. Only enable this for a link you trust and intend to share."))input.checked=false;
+}
+function collectShortcuts(){
+  return [...document.querySelectorAll("[data-shortcut]")].map(row=>({label:row.querySelector('[data-link-field="label"]').value.trim(),url:row.querySelector('[data-link-field="url"]').value.trim(),show_remote:row.querySelector('[data-link-field="show_remote"]').checked,remote_override:row.querySelector('[data-link-field="remote_override"]').checked}));
+}
+function addShortcut(){ fullConfig.shortcuts=collectShortcuts(); fullConfig.shortcuts.push({label:"",url:"",show_remote:false});renderShortcutEditors(); }
+function removeShortcut(index){ fullConfig.shortcuts=collectShortcuts();fullConfig.shortcuts.splice(index,1);renderShortcutEditors(); }
 function esc(s){return String(s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]))}
 function lvlClass(l){ return l==="error"?"err":l==="warning"?"warn":"ok" }
 function applyTheme(t){ document.documentElement.setAttribute("data-theme", t); theme=t; }
@@ -1131,6 +1181,7 @@ async function refresh(){
     searchKinds = data.search_kinds || ["movie","series"];
     syncSearchKinds(); syncSearchInstances();
     uiConfig = data.ui || uiConfig;
+    renderShortcuts(data.shortcuts||[]);
     if(data.theme && data.theme!==theme) applyTheme(data.theme);
     firstLoad = false;
     paint();
@@ -1520,7 +1571,7 @@ function closeStats(){ document.getElementById("statsOverlay").classList.remove(
 const HELP_TOPICS = {
   public: {
     title: "Remote access", sub: "Monitor (and request) from outside your network",
-    body: `<p>This opens a <b>second, restricted port</b> you can reach from outside your home. It shows live service status, and (if you allow it) lets you search and request media. It never exposes your API keys, passwords, or internal addresses.</p>
+    body: `<p>This opens a <b>second, restricted port</b> you can reach from outside your home. It shows live service status, and (if you allow it) lets you search and request media. It never exposes your API keys or passwords. Browser links are shared only when you explicitly enable them.</p>
       <p style="font-weight:600;margin:14px 0 6px">How to use it safely</p>
       <ol>
         <li>Set a long, random <b>access token</b> (use Generate). Anyone with the token can use the endpoint, so treat it like a password.</li>
@@ -1732,15 +1783,34 @@ function setSettingsTab(t){
   if(groups) groups.classList.toggle("cols", t==="services");
 }
 
+let savedSettingsBaseline=null;
+function syncStorageMode(){
+  const selected=document.getElementById("storageMode").value==="selected";
+  const sources=document.getElementById("storageInstances");sources.disabled=!selected;
+  document.getElementById("storageEmpty").hidden=!selected||sources.selectedOptions.length>0;
+}
+function renderStorageInstances(){
+  const choices=Object.entries(fullConfig.services).filter(([n,svc])=>["radarr","sonarr"].includes(svc.app||n));
+  const ids=new Set(choices.map(([n])=>n));
+  fullConfig.ui.storage_instances=(fullConfig.ui.storage_instances||[]).filter(n=>ids.has(n));
+  document.getElementById("storageInstances").innerHTML=choices.map(([n,svc])=>`<option value="${esc(n)}" ${fullConfig.ui.storage_instances.includes(n)?"selected":""}>${esc(svc.label||n)}</option>`).join("");
+  syncStorageMode();
+}
 async function openSettings(focusService){
   if(GT_PUBLIC) return;   // settings are never reachable on the public view
   fullConfig = await (await fetch("/api/config")).json();
+  savedSettingsBaseline={port:fullConfig.port,public:JSON.stringify(fullConfig.public||{})};
   applyTheme(fullConfig.theme||"auto");
   document.querySelectorAll("#themeSeg button").forEach(btn=>btn.classList.toggle("active",btn.dataset.theme===theme));
   document.getElementById("intervalInput").value = fullConfig.poll_interval||30;
   document.getElementById("portInput").value = fullConfig.port||9595;
   // general: ui prefs
   const ui = fullConfig.ui || {};
+  document.getElementById("allowedHosts").value=(fullConfig.allowed_hosts||[]).join(", ");
+  document.getElementById("storageMode").value=ui.storage_mode||"all";
+  document.getElementById("showShortcuts").checked=!!ui.show_shortcuts;
+  renderStorageInstances();
+  renderShortcutEditors();
   document.getElementById("uiUpdateCheck").checked = ui.update_check !== false;
   document.getElementById("uiSound").checked = !!ui.sound_enabled;
   document.getElementById("uiSoundUrl").value = ui.sound_url || "";
@@ -1904,7 +1974,7 @@ function renderServiceGroups(focus){
   const BETA_NOTE={
     jellyfin: "Beta: Jellyfin support is limited to monitoring and live stats (now-playing). Search, requests, and other features aren't available yet.",
     tunarr: "Beta: covers reachability and Tunarr's own health checks (ffmpeg, hardware acceleration, etc.). Channels and stats aren't surfaced yet.",
-    sabnzbd: "Beta: monitoring only (reachability, API key, and a paused-queue warning). The download queue isn't surfaced yet.",
+    sabnzbd: "Beta: health, active downloads, paused queues, and recent failed downloads.",
     nzbget: "Beta: monitoring only (reachability, login, and a paused-queue warning). The download queue isn't surfaced yet."
   };
   // per-service ⓘ info popups (keyed by instance name) -> a HELP_TOPICS key
@@ -1930,11 +2000,12 @@ function renderServiceGroups(focus){
   const orderedServices=Object.entries(fullConfig.services)
     .sort((a,b)=>typeRank(a[1].type)-typeRank(b[1].type));
   for(const [name,svc] of orderedServices){
-    const req=["label", ...fieldsFor(name, svc), ...(svc.type==="docker"?["containers"]:[])];
+    const req=["label", "link_url", ...fieldsFor(name, svc), ...(svc.type==="docker"?["containers"]:[])];
     const fields=req.map(f=>{
       const val=esc(svc[f]||"");
+      const fieldLabel=svc.type==="qbit"&&f==="api_key"?"API key (optional; replaces username/password)":(FIELD_LABELS[f]||f);
       const type=["password","api_key","token"].includes(f)?"password":"text";
-      return `<div class="field"><label for="field-${name}-${f}">${FIELD_LABELS[f]||f}</label>
+      return `<div class="field"><label for="field-${name}-${f}">${fieldLabel}</label>
         <input id="field-${name}-${f}" data-svc="${name}" data-field="${f}" type="${type}" value="${val}" placeholder="${FIELD_LABELS[f]||f}"></div>`;
     }).join("");
     const note = BETA_NOTE[svc.type] ? `<div class="beta-note">${esc(BETA_NOTE[svc.type])}</div>` : "";
@@ -1952,7 +2023,7 @@ function renderServiceGroups(focus){
           <div><div class="tl-text">Enable this service</div><div class="tl-sub">Off = not monitored, hidden, and never prompted</div></div>
           <label class="switch"><input type="checkbox" data-svc="${name}" data-flag="active" ${svc.disabled?"":"checked"}><span class="track"></span></label>
         </div>
-        <div class="group-fields ${open?"":"collapsed"}" id="gf-${name}">${note}${fields}<button class="btn" onclick="testService('${name}', this)">Test connection</button> ${name!==svc.app?`<button class="btn" onclick="removeInstance('${name}')">Remove instance</button>`:""}<div id="test-${name}" role="status"></div></div>
+        <div class="group-fields ${open?"":"collapsed"}" id="gf-${name}">${note}${svc.type==="qbit"?'<p class="tl-sub">Use an API key on supported qBittorrent versions, or a Web UI username and password. A configured API key takes priority.</p>':""}${fields}<label><input type="checkbox" data-svc="${name}" data-flag="link_remote" ${svc.link_remote?"checked":""}> Show Browser URL in remote view</label><label><input type="checkbox" data-svc="${name}" data-flag="link_remote_override" onchange="confirmRemoteOverride(this)" ${svc.link_remote_override?"checked":""}> Override remote link protection for this service</label><p class="tl-sub">Remote links require an explicit Browser URL. Protection blocks query strings, fragments, and known credentials unless you accept the override risk. The override shares the full URL with remote viewers. Monitoring addresses are not shared automatically.</p><button class="btn" onclick="testService('${name}', this)">Test connection</button> ${name!==svc.app?`<button class="btn" onclick="removeInstance('${name}')">Remove instance</button>`:""}<div id="test-${name}" role="status"></div></div>
       </div>`);
   }
 }
@@ -1964,13 +2035,17 @@ function collectSettings(){
   fullConfig.poll_interval = Math.max(5, parseInt(document.getElementById("intervalInput").value)||30);
   fullConfig.port = Math.min(65535, Math.max(1, parseInt(document.getElementById("portInput").value)||9595));
   document.querySelectorAll('#serviceGroups input[data-field]').forEach(inp=>{
-    fullConfig.services[inp.dataset.svc][inp.dataset.field] = inp.value.trim();
+    fullConfig.services[inp.dataset.svc][inp.dataset.field] = inp.dataset.field==="password" ? inp.value : inp.value.trim();
   });
   document.querySelectorAll('#serviceGroups input[data-flag]').forEach(inp=>{
     const svc=fullConfig.services[inp.dataset.svc];
     // one toggle now: enabled = monitored AND shown; off = disabled AND hidden
     if(inp.dataset.flag==="active"){ svc.disabled = !inp.checked; svc.hidden = !inp.checked; }
+    if(inp.dataset.flag==="link_remote") svc.link_remote=inp.checked;
+    if(inp.dataset.flag==="link_remote_override") svc.link_remote_override=inp.checked;
   });
+  fullConfig.allowed_hosts=document.getElementById("allowedHosts").value.split(",").map(h=>h.trim()).filter(Boolean).map(h=>{try{return /^https?:\/\//i.test(h)?new URL(h).hostname:h;}catch{return h;}});
+  fullConfig.shortcuts=collectShortcuts();
   // notifications
   const ignore=[...document.querySelectorAll('#notifIgnore .chip.on')].map(c=>c.dataset.svc);
   fullConfig.notifications = {
@@ -1997,6 +2072,11 @@ function collectSettings(){
   };
   // ui prefs
   fullConfig.ui = {
+    ...fullConfig.ui,
+    show_storage:document.getElementById("storageMode").value!=="off",
+    storage_mode:document.getElementById("storageMode").value,
+    storage_instances:[...document.getElementById("storageInstances").selectedOptions].map(o=>o.value),
+    show_shortcuts:document.getElementById("showShortcuts").checked,
     update_check: document.getElementById("uiUpdateCheck").checked,
     sound_enabled: document.getElementById("uiSound").checked,
     sound_url: document.getElementById("uiSoundUrl").value.trim()
@@ -2022,8 +2102,8 @@ function collectSettings(){
 }
 
 async function saveSettings(){
-  const prevPort = fullConfig.port;
-  const prevPublic = JSON.stringify(fullConfig.public||{});
+  const prevPort = savedSettingsBaseline.port;
+  const prevPublic = savedSettingsBaseline.public;
   collectSettings();
   // a public endpoint with no token would refuse to start; block the save instead
   if(fullConfig.public.enabled && !fullConfig.public.token){
@@ -2102,8 +2182,8 @@ function onboardToStep2(){
     const fields=s.fields.map(f=>{
       const val=esc((serviceMeta[s.service]&&f==="url")?(serviceMeta[s.service].url||s.url||""):(s.url&&f==="url"?s.url:""));
       const hint=f==="url"?"Server address, e.g. http://192.168.1.50:7878":(FIELD_LABELS[f]||f);
-      return `<div class="field"><label for="field-${name}-${f}">${FIELD_LABELS[f]||f}</label>
-        <input id="field-${name}-${f}" data-svc="${s.service}" data-field="${f}" type="${f==="password"?"password":"text"}" value="${val}" placeholder="${hint}"></div>`;
+      return `<div class="field"><label for="onboard-${s.service}-${f}">${s.type==="qbit"&&f==="api_key"?"API key (optional; replaces username/password)":(FIELD_LABELS[f]||f)}</label>
+        <input id="onboard-${s.service}-${f}" data-svc="${s.service}" data-field="${f}" type="${["password","api_key","token"].includes(f)?"password":"text"}" value="${val}" placeholder="${hint}"></div>`;
     }).join("");
     const ONBOARD_BETA = {
       jellyfin: "Beta: Jellyfin support is limited to monitoring and live stats (now-playing) for now.",
@@ -2124,7 +2204,9 @@ async function skipOnboard(){
   // mark setup done so it won't nag again; nothing else changes
   const cfg=await (await fetch("/api/config")).json();
   cfg.setup_complete=true;
-  await fetch("/api/config",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({config:cfg})});
+  const response=await fetch("/api/config",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({config:cfg})});
+  const result=await response.json();
+  if(!response.ok||!result.ok){toast(result.error||"Could not save setup. Please try again.");return;}
   document.getElementById("onboardOverlay").classList.remove("show");
 }
 
@@ -2136,10 +2218,12 @@ async function saveOnboard(){
   });
   // write entered credentials for picked services
   document.querySelectorAll('#onboardBody input[data-field]').forEach(inp=>{
-    const v=inp.value.trim(); if(v) cfg.services[inp.dataset.svc][inp.dataset.field]=v;
+    const v=inp.dataset.field==="password" ? inp.value : inp.value.trim(); if(v) cfg.services[inp.dataset.svc][inp.dataset.field]=v;
   });
   cfg.setup_complete=true;
-  await fetch("/api/config",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({config:cfg})});
+  const response=await fetch("/api/config",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({config:cfg})});
+  const result=await response.json();
+  if(!response.ok||!result.ok){toast(result.error||"Could not save setup. Please try again.");return;}
   document.getElementById("onboardOverlay").classList.remove("show");
   toast("Setup complete"); setTimeout(refresh,400);
 }
@@ -2175,7 +2259,7 @@ function renderHistory(data){
       // Observed health · 30d: label + % on one line, thin coloured bar under it (same footprint)
       const upHtml = (up!=null) ? `<div class="hc-up"><span>Observed health · 30d</span><b>${up.toFixed(1)}%</b></div>
         <div class="hc-upbar"><span style="width:${Math.max(0,Math.min(100,up))}%;background:${uptimeColor(up)}"></span></div>` : "";
-      return `<div class="hist-card"><div class="hc-name">${esc(n)}</div>${upHtml}
+      return `<div class="hist-card"><div class="hc-name">${esc(displayServiceName(n))}</div>${upHtml}
         <div class="hc-row"><span>Down · 24h</span><b>${c.day}</b></div>
         <div class="hc-row"><span>Down · 7d</span><b>${c.week}</b></div>
         <div class="hc-row"><span>Down · 30d</span><b>${c.month}</b></div></div>`;
@@ -2187,8 +2271,8 @@ function renderHistory(data){
     html += `<div class="hist-h">Recent events</div>`;
     const evHtml = e=>{
       const down = e.kind==="down";
-      const line = down ? `<b>${esc(e.service)}</b> went down: ${esc(e.summary||"")}`
-                        : `<b>${esc(e.service)}</b> recovered`;
+      const line = down ? `<b>${esc(displayServiceName(e.service))}</b> went down: ${esc(e.summary||"")}`
+                        : `<b>${esc(displayServiceName(e.service))}</b> recovered`;
       return `<div class="hist-ev"><span class="he-dot ${down?'down':'recover'}"></span>
         <div class="he-body"><div class="he-line">${line}</div>
         <div class="he-time">${esc(e.time||"")}</div></div></div>`;
@@ -2202,7 +2286,7 @@ function renderHistory(data){
     }
   }
   const actions=data.actions||[];
-  html+='<div class="hist-h">Action history</div>'+ (actions.length?actions.map(a=>`<div class="hist-ev"><div class="he-body"><b>${esc(a.service)} · ${esc(a.action)}</b><div>${esc(a.status)}${a.automatic?" · automatic":""} · ${esc(a.message||"")}</div><div class="he-time">${esc(new Date(a.ts*1000).toLocaleString())}</div></div></div>`).join(""):'<p>No actions recorded yet.</p>');
+  html+='<div class="hist-h">Action history</div>'+ (actions.length?actions.map(a=>`<div class="hist-ev"><div class="he-body"><b>${esc(displayServiceName(a.service))} · ${esc(a.action)}</b><div>${esc(a.status)}${a.automatic?" · automatic":""} · ${esc(a.message||"")}</div><div class="he-time">${esc(new Date(a.ts*1000).toLocaleString())}</div></div></div>`).join(""):'<p>No actions recorded yet.</p>');
   body.innerHTML=html;
 }
 
@@ -2304,7 +2388,7 @@ async function runSearch(){
       const icon={movie:"🎬",series:"📺",book:"📚",music:"🎵"}[searchKind]||"🔍";
       const img=safeHttpUrl(m.poster)?`<img class="img" src="${esc(safeHttpUrl(m.poster))}" alt="" loading="lazy" referrerpolicy="no-referrer">`:`<div class="img ph">${icon}</div>`;
       const tag=m.already?`<span class="tag">In library</span>`:"";
-      return `<div class="poster" id="poster-${i}" onclick="addMedia(${i})">${img}${tag}
+      return `<div class="poster" id="poster-${i}" onclick="addMedia(${i})"><div class="poster-art">${img}${tag}</div>
         <div class="meta"><div class="pt">${esc(m.title)}</div><div class="py">${esc(String(m.year||""))}</div></div></div>`;
     }).join("")+'</div>';
   }catch(e){ box.innerHTML=`<div class="search-status">Search failed.</div>`; }
@@ -2324,6 +2408,7 @@ async function addMedia(i){
   }
   pendingAdd = { i, item, kind:searchKind, service:document.getElementById("searchInstance").value };
 
+  const dialogRequest=pendingAdd;
   // fill the confirm modal
   document.getElementById("confirmTitle").textContent = `Add “${item.title}”?`;
   document.getElementById("confirmSub").textContent =
@@ -2336,7 +2421,8 @@ async function addMedia(i){
   // load quality profiles + remembered default
   try{
     const r=await (await fetch("/api/profiles",{method:"POST",headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({kind:pendingAdd.kind,service:pendingAdd.service})})).json();
+      body:JSON.stringify({kind:dialogRequest.kind,service:dialogRequest.service})})).json();
+    if(pendingAdd!==dialogRequest)return;
     if(!r.ok || !r.profiles.length){
       sel.innerHTML=`<option value="">${esc(r.error||"No profiles found")}</option>`;
       return;
@@ -2350,7 +2436,7 @@ async function addMedia(i){
     // if no remembered default, leave first selected (browser default)
     sel.disabled=false;
     document.getElementById("confirmAddBtn").disabled=false;
-  }catch(e){ sel.innerHTML=`<option value="">Couldn't load profiles</option>`; }
+  }catch(e){ if(pendingAdd===dialogRequest)sel.innerHTML=`<option value="">Couldn't load profiles</option>`; }
 }
 
 function closeConfirm(){ document.getElementById("confirmOverlay").classList.remove("show"); pendingAdd=null; }
@@ -2387,15 +2473,15 @@ function addInstance(){
   const template=fullConfig.services[app]; if(!template) return;
   let number=2; while(fullConfig.services[app+"_"+number]) number++;
   const name=app+"_"+number;
-  const fresh={...template,app,label:(template.label||app)+" "+number,disabled:false,hidden:false};
+  const fresh={...template,app,label:(template.label||app)+" "+number,disabled:false,hidden:false,link_url:"",link_remote:false,link_remote_override:false};
   for(const key of ["api_key","password","username","token"]) if(key in fresh) fresh[key]="";
   fullConfig.services[name]=fresh;
-  renderServiceGroups(name);
+  renderServiceGroups(name); renderStorageInstances();
   document.getElementById("gf-"+name).scrollIntoView({block:"nearest"});
 }
 function removeInstance(name){
   if(!confirm("Remove this instance from GuardTowarr? The service and its media are not changed.")) return;
-  collectSettings(); delete fullConfig.services[name]; renderServiceGroups();
+  collectSettings(); delete fullConfig.services[name]; renderServiceGroups(); renderStorageInstances();
 }
 async function testService(name,button){
   collectSettings(); button.disabled=true;
@@ -2416,7 +2502,7 @@ for(const overlay of document.querySelectorAll(".overlay")){
   let shown=overlay.classList.contains("show");
   new MutationObserver(()=>{
     const next=overlay.classList.contains("show"); if(next===shown)return; shown=next;
-    if(next){modalFocus.set(overlay,document.activeElement); (modal.querySelector("input,select,button,[tabindex='0']")||modal).focus();}
+    if(next){modalFocus.set(overlay,document.activeElement); (modal.querySelector("input,select,button,[tabindex='0']")||modal).focus({preventScroll:true}); overlay.scrollTop=0;}
     else {const previous=modalFocus.get(overlay);if(previous?.isConnected)previous.focus();}
   }).observe(overlay,{attributes:true,attributeFilter:["class"]});
   modal.addEventListener("keydown",e=>{

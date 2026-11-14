@@ -115,6 +115,16 @@ The system-tray feature is desktop-only and isn't part of the Docker image; the 
 
 ---
 
+## What's new in 2.0.1?
+
+A quick round of fixes from your 2.0 reports: properly sized Safari posters,
+custom-domain access, clearer qBittorrent login errors, storage controls, dashboard
+shortcuts, and your chosen service names in history.
+
+Your existing qBittorrent username and password still work. API keys are now an
+option on supported versions; leave the key blank to keep using your login.
+See the [patch notes](RELEASE_NOTES_v2.0.1.md) for setup details.
+
 ## What's new in 2.0?
 
 Running more than one Radarr or Sonarr? You can now give each instance its own

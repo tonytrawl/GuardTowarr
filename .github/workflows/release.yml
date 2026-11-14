@@ -79,6 +79,7 @@ jobs:
           docker buildx imagetools inspect tonytrawl/guardtowarr:latest --raw > latest.json
           cmp version.json latest.json
       - name: Update Docker Hub description
+        continue-on-error: true  # Repository metadata permissions are separate from image push access.
         env:
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}

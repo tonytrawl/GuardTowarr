@@ -31,6 +31,7 @@ import tempfile
 import shutil
 import socket
 import http.client
+from http.cookies import SimpleCookie
 import ipaddress
 import threading
 import concurrent.futures
@@ -59,7 +60,7 @@ PORT = int(os.environ.get("GUARDTOWARR_PORT", "9595"))  # 9595: avoids Readarr's
 POLL_INTERVAL = 30  # seconds (default)
 
 # Bump this when you cut a new GitHub release (must match the release tag, e.g. v1.0.0).
-CURRENT_VERSION = "v2.0.0"
+CURRENT_VERSION = "v2.0.1"
 GITHUB_REPO = "tonytrawl/GuardTowarr"
 RELEASES_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 RELEASES_PAGE = f"https://github.com/{GITHUB_REPO}/releases/latest"
@@ -79,6 +80,8 @@ _DEFAULT_BLOCKED_EXTS = ["exe", "scr", "bat", "cmd", "com", "msi",
                          "vbs", "js", "jar", "lnk", "pif", "reg", "hta", "ps1"]
 
 DEFAULT_CONFIG = {
+    "allowed_hosts": [],
+    "shortcuts": [],
     "poll_interval": 30,
     "setup_complete": False,   # becomes True after first-run onboarding
     "port": 9595,
@@ -122,7 +125,11 @@ DEFAULT_CONFIG = {
     "ui": {
         "sound_enabled": False,       # chime/flash on new error
         "sound_url": "",              # custom sound (URL); blank = built-in beep
-        "update_check": True          # daily GitHub release check + dismissible notice
+        "update_check": True,         # daily GitHub release check + dismissible notice
+        "show_storage": True,
+        "storage_mode": "all",
+        "storage_instances": [],      # empty = all enabled Arr instances
+        "show_shortcuts": False
     },
     "beta": {
         "torrents": True,             # show the active-torrents view button (on by default)
@@ -177,6 +184,97 @@ def queue_instances(cfg):
     return [(n, _QUEUE_ARR[service_app(n, s)]) for n, s in active_instances(cfg, _QUEUE_ARR)]
 
 
+def valid_admin_host(value):
+    """Accept exact hostnames only, never wildcard patterns, URLs, or ports."""
+    if not isinstance(value, str) or not value or value != value.strip():
+        return False
+    try:
+        name = value.rstrip(".").encode("idna").decode("ascii")
+        return len(name) <= 253 and all(re.fullmatch(r"[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?", label) for label in name.split("."))
+    except UnicodeError:
+        return False
+
+
+def normalize_admin_host(value):
+    if not isinstance(value, str):
+        return ""
+    value = value.strip()
+    if "://" in value:
+        try:
+            parsed = urllib.parse.urlsplit(value)
+            parsed.port
+            if parsed.scheme not in ("http", "https") or parsed.username or parsed.password:
+                return ""
+            value = parsed.hostname or ""
+        except ValueError:
+            return ""
+    return value.rstrip(".").encode("idna").decode("ascii").lower() if valid_admin_host(value) else ""
+
+
+def safe_link_url(value):
+    if not isinstance(value, str) or any(c.isspace() or c == "\\" for c in value):
+        return ""
+    try:
+        p = urllib.parse.urlsplit(value)
+        if p.scheme not in ("http", "https") or not p.hostname or p.username or p.password:
+            return ""
+        p.port  # reject malformed/out-of-range ports
+        return value
+    except ValueError:
+        return ""
+
+
+def remote_link_safe(url, cfg):
+    """Remote shortcuts must not carry query/fragment credentials or known secrets."""
+    if not safe_link_url(url):
+        return False
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.query or parsed.fragment:
+        return False
+    decoded = url
+    for _ in range(3):
+        decoded = urllib.parse.unquote(decoded)
+    def contains_secret(obj):
+        if isinstance(obj, dict):
+            for key, value in obj.items():
+                if isinstance(value, str) and value and any(k in key for k in ("password", "token", "api_key", "webhook", "username")):
+                    if value in url or value in decoded:
+                        return True
+                if contains_secret(value):
+                    return True
+        elif isinstance(obj, list):
+            return any(contains_secret(value) for value in obj)
+        return False
+    return not contains_secret(cfg)
+
+
+def dashboard_links(cfg, public=False):
+    if not cfg.get("ui", {}).get("show_shortcuts"):
+        return []
+    links = []
+    instances = active_instances(cfg)
+    counts = {}
+    for name, svc in instances:
+        app = service_app(name, svc)
+        counts[app] = counts.get(app, 0) + 1
+    for name, svc in instances:
+        if svc.get("hidden") or (public and svc.get("link_remote") is not True):
+            continue
+        url = safe_link_url(svc.get("link_url") or ("" if public else svc.get("url")))
+        if url and (not public or svc.get("link_remote_override") is True or remote_link_safe(url, cfg)):
+            app = service_app(name, svc)
+            label = (svc.get("label") or name) if counts[app] > 1 else (
+                app.capitalize() if svc.get("type") == "arr" else SERVICE_REGISTRY.get(svc.get("type"), {}).get("label", app))
+            links.append({"label": label, "shortcut_url": url})
+    for row in cfg.get("shortcuts", []):
+        if public and row.get("show_remote") is not True:
+            continue
+        url = safe_link_url(row.get("url"))
+        if url and (not public or row.get("remote_override") is True or remote_link_safe(url, cfg)):
+            links.append({"label": row.get("label", "Shortcut"), "shortcut_url": url})
+    return links
+
+
 def _merge_defaults(cfg):
     """Ensure new keys exist on configs created by older versions. Also tolerant
     of a config that's missing, empty, or not a dict (e.g. a hand-edited or
@@ -184,6 +282,9 @@ def _merge_defaults(cfg):
     an empty dict and fill in every default, rather than crashing."""
     if not isinstance(cfg, dict):
         cfg = {}
+    old_ui = cfg.get("ui", {})
+    if isinstance(old_ui, dict) and "storage_mode" not in old_ui:
+        old_ui["storage_mode"] = "off" if old_ui.get("show_storage") is False else ("selected" if old_ui.get("storage_instances") else "all")
     # Coerce services to a dict up front so every later check (including the
     # setup_complete inference below) is safe even if the file had services:null.
     if not isinstance(cfg.get("services"), dict):
@@ -316,6 +417,13 @@ def _merge_defaults(cfg):
         for key, default in DEFAULT_CONFIG[section].items():
             if not isinstance(cfg[section].get(key), type(default)):
                 cfg[section][key] = copy.deepcopy(default)
+    cfg["allowed_hosts"] = [normalize_admin_host(h) for h in cfg.get("allowed_hosts", []) if normalize_admin_host(h)] if isinstance(cfg.get("allowed_hosts"), list) else []
+    cfg["shortcuts"] = [row for row in cfg.get("shortcuts", []) if isinstance(row, dict)
+                        and isinstance(row.get("label"), str) and safe_link_url(row.get("url"))] if isinstance(cfg.get("shortcuts"), list) else []
+    cfg["ui"]["storage_instances"] = [n for n in cfg["ui"]["storage_instances"] if isinstance(n, str)]
+    if cfg["ui"]["storage_mode"] not in ("all", "selected", "off"):
+        cfg["ui"]["storage_mode"] = "all"
+    cfg["ui"]["show_storage"] = cfg["ui"]["storage_mode"] != "off"
     cfg["schema_version"] = 2
     return cfg
 
@@ -355,7 +463,10 @@ def get_config():
 
 
 def missing_credentials(svc):
-    """Return list of required fields that are blank for an enabled service."""
+    """Return required fields that are blank, accepting either qBittorrent login method."""
+    if svc.get("type") == "qbit":
+        fields = ("url", "api_key") if svc.get("api_key", "").strip() else ("url", "username", "password")
+        return [f for f in fields if not str(svc.get(f, "")).strip()]
     req = REQUIRED_FIELDS.get(svc.get("type"), [])
     return [f for f in req if not str(svc.get(f, "")).strip()]
 
@@ -502,24 +613,7 @@ def check_plex(name, cfg):
 def check_qbit(name, cfg):
     base = cfg["url"].rstrip("/")
     try:
-        # login to get session cookie
-        data = urllib.parse.urlencode({
-            "username": cfg.get("username", ""),
-            "password": cfg.get("password", "")
-        }).encode()
-        req = urllib.request.Request(f"{base}/api/v2/auth/login", data=data,
-                                     headers={"Referer": base})
-        with safe_urlopen(req, timeout=10) as r:
-            cookie = r.headers.get("Set-Cookie", "")
-            login_body = r.read().decode().strip()
-        if login_body != "Ok." and not cookie:
-            return svc_result(name, "error", "Login failed (check username/password)",
-                [_issue("error", "Authentication",
-                        "Couldn't log in to the qBittorrent Web UI. Check the username and password.",
-                        DOC_LINKS["qbit_login"])])
-        cookie = cookie.split(";")[0] if cookie else None
-        # get transfer info + torrent list for stalled/errored states
-        status, body = http_get(f"{base}/api/v2/torrents/info", auth_cookie=cookie)
+        _, body = _qbit_request(cfg, "torrents/info")
         torrents = json.loads(body) if body.strip() else []
         errs = []
         bad_states = {"error", "missingFiles", "stalledDL", "unknown"}
@@ -553,6 +647,8 @@ def check_qbit(name, cfg):
         if errs:
             return svc_result(name, "warning", f"{len(errs)} stalled torrent(s)", errs)
         return svc_result(name, "ok", f"Online ({len(torrents)} torrents)", [])
+    except QbitRequestError as e:
+        return svc_result(name, "error", str(e), [_issue("error", "Authentication / access", str(e), DOC_LINKS["qbit_login"])])
     except Exception as e:
         return svc_result(name, "error", f"Unreachable: {e}",
             [_issue("error", "Unreachable",
@@ -961,7 +1057,7 @@ SERVICE_REGISTRY = {
     "qbit": {
         "label": "qBittorrent",
         "blurb": "Torrent client",
-        "fields": ["url", "username", "password"],
+        "fields": ["url", "username", "password", "api_key"],
         "checker": check_qbit,
         # qBittorrent gives us the detailed live torrent view on top of uptime.
         "capabilities": ["monitor", "queue"],
@@ -1106,7 +1202,7 @@ def _build_default_services():
     for stype, spec in SERVICE_REGISTRY.items():
         for inst_name, default_url in spec["instances"].items():
             entry = {"enabled": True, "disabled": True, "hidden": False, "app": inst_name, "label": inst_name,
-                     "url": default_url, "type": stype}
+                     "url": default_url, "type": stype, "link_url": "", "link_remote": False, "link_remote_override": False}
             # give each credential field (everything except url) a blank default
             for f in spec["fields"]:
                 if f != "url":
@@ -1347,15 +1443,76 @@ def media_add(cfg, kind, item, profile_id=None, service=None, root_folder=None):
 # ----------------------------------------------------------------------------
 # TORRENTS (qBittorrent active list, beta feature)
 # ----------------------------------------------------------------------------
-def _qbit_login(svc):
-    base = svc["url"].rstrip("/")
-    data = urllib.parse.urlencode({
-        "username": svc.get("username", ""), "password": svc.get("password", "")
-    }).encode()
-    req = urllib.request.Request(f"{base}/api/v2/auth/login", data=data, headers={"Referer": base})
-    with safe_urlopen(req, timeout=10) as r:
-        cookie = r.headers.get("Set-Cookie", "")
-    return base, (cookie.split(";")[0] if cookie else None)
+class QbitRequestError(ValueError):
+    pass
+
+
+_QBIT_SESSIONS = {}
+_QBIT_SESSION_LOCK = threading.Lock()
+
+
+def _qbit_request(svc, endpoint, method="GET", data=None):
+    """One auth path for every qBittorrent call; never replay a mutation."""
+    base = svc.get("url", "").rstrip("/")
+    parsed = urllib.parse.urlsplit(base)
+    origin = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, "", "", ""))
+    api_key = svc.get("api_key", "").strip()
+    identity = hashlib.sha256(json.dumps([base, svc.get("username", ""), svc.get("password", ""), api_key]).encode()).hexdigest()
+    with _QBIT_SESSION_LOCK:
+        if identity not in _QBIT_SESSIONS:
+            if len(_QBIT_SESSIONS) >= 128:
+                _QBIT_SESSIONS.pop(next(iter(_QBIT_SESSIONS)))
+            _QBIT_SESSIONS[identity] = {"lock": threading.Lock(), "cookie": "", "expires": 0, "retry_at": 0}
+        session = _QBIT_SESSIONS[identity]
+    with session["lock"]:
+        if time.monotonic() < session["retry_at"]:
+            raise QbitRequestError(session["error"] + " Retrying after a short cooldown.")
+        headers = {"Referer": base + "/", "Origin": origin}
+        def fail(message):
+            session.update(cookie="", expires=0, retry_at=time.monotonic()+60, error=message)
+            raise QbitRequestError(message)
+        def login():
+            if not svc.get("username") or not svc.get("password"):
+                fail("Configure a qBittorrent API key or a Web UI username and password.")
+            payload = urllib.parse.urlencode({"username": svc["username"], "password": svc["password"]}).encode()
+            req = urllib.request.Request(base + "/api/v2/auth/login", data=payload, headers=headers)
+            try:
+                with safe_urlopen(req, timeout=10) as response:
+                    body = response.read().decode("utf-8", "replace").strip()
+                    cookies = SimpleCookie()
+                    for value in response.headers.get_all("Set-Cookie", []):
+                        cookies.load(value)
+            except urllib.error.HTTPError as e:
+                if e.code in (401, 403):
+                    fail("qBittorrent login rejected (HTTP %s). Check its Web UI log for an IP ban, proxy/host validation, or invalid credentials." % e.code)
+                raise
+            if body != "Ok.":
+                fail("qBittorrent rejected the username/password. Check the Web UI credentials.")
+            cookie = "SID=" + cookies["SID"].value if "SID" in cookies else ""
+            # Ok. without SID is supported for explicitly configured auth bypass.
+            session.update(cookie=cookie, expires=time.monotonic()+600, retry_at=0)
+        cached = session["expires"] > time.monotonic()
+        if api_key:
+            headers["X-API-Key"] = api_key
+        elif not cached:
+            login()
+        for attempt in range(2):
+            request_headers = dict(headers)
+            if not api_key and session["cookie"]:
+                request_headers["Cookie"] = session["cookie"]
+            req = urllib.request.Request(base + "/api/v2/" + endpoint, headers=request_headers, data=data, method=method)
+            try:
+                with safe_urlopen(req, timeout=15) as response:
+                    return response.status, response.read().decode("utf-8", "replace")
+            except urllib.error.HTTPError as e:
+                if e.code not in (401, 403):
+                    raise
+                if api_key:
+                    fail("qBittorrent rejected API-key access (HTTP %s). Check the key, API-key support in this version, and proxy/host rules." % e.code)
+                if cached and attempt == 0 and method == "GET":
+                    login()
+                    continue
+                fail("qBittorrent denied %s (HTTP %s). Check session access, IP bans, and proxy/host rules in its Web UI log." % (endpoint.split("?", 1)[0], e.code))
 
 
 # qBittorrent states grouped into the two tabs
@@ -1365,14 +1522,13 @@ _SEEDING_STATES = {"uploading", "stalledUP", "queuedUP", "forcedUP", "checkingUP
 
 def _qbit_configured(cfg):
     svc = cfg["services"].get("qbittorrent", {})
-    return (not svc.get("disabled")) and bool(svc.get("url")) and bool(svc.get("username"))
+    return (not svc.get("disabled")) and bool(svc.get("url")) and bool(svc.get("api_key") or svc.get("username"))
 
 
 def _get_torrents_qbit(cfg):
     """Full torrent list from qBittorrent (richest data)."""
     svc = cfg["services"].get("qbittorrent", {})
-    base, cookie = _qbit_login(svc)
-    _, body = http_get(f"{base}/api/v2/torrents/info", auth_cookie=cookie)
+    _, body = _qbit_request(svc, "torrents/info")
     raw = json.loads(body) if body.strip() else []
     downloading, seeding = [], []
     for t in raw:
@@ -1544,14 +1700,9 @@ def _qbit_torrent_op(svc, op, hashes):
             not isinstance(h, str) or not re.fullmatch(r"[a-fA-F0-9]{40,64}", h) for h in hashes):
         return {"ok": False, "error": "Specify valid torrent hashes."}
     try:
-        base, cookie = _qbit_login(svc)
-        if not cookie:
-            return {"ok": False, "error": "Couldn't log in to qBittorrent."}
         data = urllib.parse.urlencode({"hashes": "|".join(hashes)}).encode()
-        req = urllib.request.Request(f"{base}/api/v2/torrents/{op}", data=data,
-                                     headers={"Referer": base, "Cookie": cookie}, method="POST")
-        with safe_urlopen(req, timeout=15) as r:
-            ok = 200 <= r.status < 300
+        status, _ = _qbit_request(svc, "torrents/" + op, method="POST", data=data)
+        ok = 200 <= status < 300
         verb = {"recheck": "Re-check", "reannounce": "Re-announce"}.get(op, op)
         return {"ok": ok, "message": (f"{verb} started." if ok else None),
                 "error": (None if ok else "qBittorrent rejected the request.")}
@@ -1922,12 +2073,11 @@ def augment_queue_issues(cfg, results):
 _MALWARE_SCANNED = {}   # torrent hash -> [] (clean) or [bad filenames]; absent = not scanned
 
 
-def _qbit_scan_files(base, cookie, h, exts):
+def _qbit_scan_files(svc, h, exts):
     """Return a list of blocked filenames in a torrent, [] if clean, or None if
     the file list isn't available yet (no metadata) so the caller retries."""
     try:
-        _, body = http_get(f"{base}/api/v2/torrents/files?hash={urllib.parse.quote(h)}",
-                           auth_cookie=cookie)
+        _, body = _qbit_request(svc, "torrents/files?" + urllib.parse.urlencode({"hash": h}))
         files = json.loads(body) if body.strip() else []
     except Exception:
         return None
@@ -1953,10 +2103,8 @@ def scan_blocked_files(cfg, results):
     handled = set()
     for client, qbit in active_instances(cfg, stype="qbit"):
         try:
-            base, cookie = _qbit_login(qbit)
-            if not cookie:
-                continue
-            _, body = http_get(f"{base}/api/v2/torrents/info", auth_cookie=cookie)
+            base = qbit["url"].rstrip("/")
+            _, body = _qbit_request(qbit, "torrents/info")
             hashes = {t.get("hash", "").lower() for t in json.loads(body)}
         except Exception:
             continue
@@ -1977,7 +2125,7 @@ def scan_blocked_files(cfg, results):
                 live.add(cache_key)
                 found = _MALWARE_SCANNED.get(cache_key)
                 if found is None:
-                    found = _qbit_scan_files(base, cookie, h, exts)
+                    found = _qbit_scan_files(qbit, h, exts)
                     if found is None:
                         continue
                     _MALWARE_SCANNED[cache_key] = found
@@ -2368,7 +2516,8 @@ def _compute_stats(cfg):
             if svc.get("type") in ("plex", "jellyfin"):
                 fn = _plex_library_counts if svc["type"] == "plex" else _jellyfin_library_counts
                 tasks[("library", name)] = pool.submit(fn, svc)
-            if service_app(name, svc) in ("radarr", "sonarr"):
+            if (service_app(name, svc) in ("radarr", "sonarr") and cfg.get("ui", {}).get("storage_mode", "all") != "off"
+                    and (cfg.get("ui", {}).get("storage_mode", "all") == "all" or name in cfg.get("ui", {}).get("storage_instances", []))):
                 tasks[("disk", name)] = pool.submit(_arr_diskspace, svc)
     libraries, drives, streams = [], [], []
     for (kind, name), future in tasks.items():
@@ -2960,8 +3109,7 @@ def check_torrent_completions(cfg):
         return
     for name, svc in active_instances(cfg, stype="qbit"):
         try:
-            base, cookie = _qbit_login(svc)
-            _, body = http_get(base + "/api/v2/torrents/info", auth_cookie=cookie)
+            _, body = _qbit_request(svc, "torrents/info")
             torrents = json.loads(body)
         except Exception:
             continue
@@ -3328,7 +3476,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if self._is_public():
             return True
         try:
-            host = urllib.parse.urlsplit("http://" + self.headers.get("Host", "")).hostname
+            raw_host = self.headers.get("Host", "")
+            if any(c in raw_host for c in "/\\@?#") or any(c.isspace() for c in raw_host):
+                raise ValueError()
+            parsed_host = urllib.parse.urlsplit("http://" + raw_host)
+            parsed_host.port
+            host = parsed_host.hostname
             if not host:
                 raise ValueError()
             try:
@@ -3338,9 +3491,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 pass
             if host.lower().rstrip(".") in {"localhost", socket.gethostname().lower(), socket.getfqdn().lower()}:
                 return True
+            allowed = get_config().get("allowed_hosts", []) + os.environ.get("GUARDTOWARR_ALLOWED_HOSTS", "").split(",")
+            normalized = host.rstrip(".").encode("idna").decode("ascii").lower()
+            if normalized in {h.strip().rstrip(".").encode("idna").decode("ascii").lower() for h in allowed if valid_admin_host(h.strip())}:
+                return True
             raise ValueError()
-        except ValueError:
-            return self._deny(403, "Use the server IP address or local hostname for the admin dashboard.")
+        except (ValueError, UnicodeError):
+            return self._deny(403, "Unrecognized admin hostname. Use the server IP or add your exact domain to GUARDTOWARR_ALLOWED_HOSTS / Settings → General → Allowed dashboard domains.")
 
     def do_GET(self):
         if not self._admin_host_ok():
@@ -3439,6 +3596,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             state["beta"] = cfg.get("beta", {"torrents": False})
             state["notifications_enabled"] = cfg.get("notifications", {}).get("enabled", False)
             state["ui"] = cfg.get("ui", {})
+            state["shortcuts"] = dashboard_links(cfg, self._is_public())
             # On the public port, scrub anything that leaks internal addresses or
             # would let a remote visitor reconfigure the app. Service health still
             # shows; the URLs/IPs and onboarding values do not.
@@ -3923,6 +4081,7 @@ def public_payload(value, cfg):
             for item in obj:
                 gather(item)
     gather(cfg)
+    approved_links = {row["shortcut_url"] for row in dashboard_links(cfg, True)}
     safe_docs = {"wiki.servarr.com", "support.plex.tv", "jellyfin.org", "docs.docker.com",
                  "sabnzbd.org", "nzbget.com", "cleanuparr.github.io", "tunarr.com", "docs.ombi.app",
                  "docs.jellyseerr.dev", "github.com"}
@@ -3934,6 +4093,8 @@ def public_payload(value, cfg):
             return [clean(v, key) for v in obj]
         if not isinstance(obj, str):
             return obj
+        if key == "shortcut_url":
+            return obj if obj in approved_links else ""
         if key in ("url", "path", "host", "rootFolderPath", "poster"):
             return ""
         if key == "fix":
@@ -3960,6 +4121,27 @@ def validate_config(cfg):
         raise ValueError("Configuration must contain a services object.")
     if len(cfg["services"]) > 100:
         raise ValueError("At most 100 service instances are supported.")
+    hosts = cfg.get("allowed_hosts", [])
+    if not isinstance(hosts, list) or len(hosts) > 50 or any(not normalize_admin_host(h) for h in hosts):
+        raise ValueError("Allowed admin hosts must be exact hostnames, without URLs, ports, or wildcards.")
+    links = cfg.get("shortcuts", [])
+    if not isinstance(links, list) or len(links) > 50:
+        raise ValueError("At most 50 custom shortcuts are supported.")
+    for row in links:
+        if not isinstance(row, dict) or not isinstance(row.get("label"), str) or not row["label"].strip() or len(row["label"]) > 100 or not safe_link_url(row.get("url")):
+            raise ValueError("Each shortcut needs a label and an HTTP(S) URL without embedded credentials.")
+        if "show_remote" in row and not isinstance(row["show_remote"], bool):
+            raise ValueError("Shortcut remote visibility must be true or false.")
+    for row in links:
+        if "remote_override" in row and not isinstance(row["remote_override"], bool):
+            raise ValueError("Remote shortcut override must be true or false.")
+        if row.get("show_remote") and row.get("remote_override") is not True and not remote_link_safe(row["url"], cfg):
+            raise ValueError("Remote shortcuts cannot contain query strings, fragments, or configured credentials.")
+    ui = cfg.get("ui", {})
+    if not isinstance(ui, dict) or not isinstance(ui.get("storage_instances", []), list) or any(not isinstance(n, str) for n in ui.get("storage_instances", [])):
+        raise ValueError("Storage instances must be a list of service IDs.")
+    if "storage_mode" in ui and ui["storage_mode"] not in ("all", "selected", "off"):
+        raise ValueError("Storage mode must be all, selected, or off.")
     for name, svc in cfg["services"].items():
         if not re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", name) or not isinstance(svc, dict):
             raise ValueError("Invalid service instance.")
@@ -3967,9 +4149,17 @@ def validate_config(cfg):
         template = DEFAULT_CONFIG["services"].get(app)
         if not template or svc.get("type", template["type"]) != template["type"]:
             raise ValueError("Unknown service application or mismatched type.")
-        for field in ("url", "label", "api_key", "token", "username", "password", "containers"):
+        for field in ("url", "label", "api_key", "token", "username", "password", "containers", "link_url"):
             if field in svc and not isinstance(svc[field], str):
                 raise ValueError(f"{name}: {field} must be text.")
+        if svc.get("link_url") and not safe_link_url(svc["link_url"]):
+            raise ValueError(f"{name}: browser URL must be HTTP(S) without embedded credentials.")
+        if "link_remote" in svc and not isinstance(svc["link_remote"], bool):
+            raise ValueError(f"{name}: remote link visibility must be true or false.")
+        if "link_remote_override" in svc and not isinstance(svc["link_remote_override"], bool):
+            raise ValueError(f"{name}: remote link override must be true or false.")
+        if svc.get("link_remote") and svc.get("link_url") and svc.get("link_remote_override") is not True and not remote_link_safe(svc["link_url"], cfg):
+            raise ValueError(f"{name}: remote browser URLs cannot contain query strings, fragments, or configured credentials.")
         url = svc.get("url", "")
         scheme = urllib.parse.urlsplit(url).scheme
         if url and scheme not in (("http", "https", "unix") if template["type"] == "docker" else ("http", "https")):

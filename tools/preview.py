@@ -21,17 +21,32 @@ for app,label in [('radarr','Movies'),('sonarr','TV'),('sabnzbd','Usenet'),('doc
     cfg['services'][app].update(disabled=False,label=label,api_key='fixture-key',url='http://fixture.invalid/'+app)
 cfg['services']['radarr_4k']={**cfg['services']['radarr'],'label':'Movies 4K','url':'http://fixture.invalid/radarr_4k'}
 cfg['beta']['lite_stats']=True
+cfg['ui']['show_shortcuts']=True
+cfg['shortcuts']=[{'label':'Request a movie or show','url':'https://example.com/requests','show_remote':True}]
+cfg['services']['qbittorrent'].update(disabled=False,label='Torrents',username='demo-user',password='demo-password',url='http://fixture.invalid/qbit')
 m.CONFIG.update(cfg);m.save_config(cfg)
 m.PAGE=(ROOT/'webpage.html').read_text(encoding='utf-8')
 
 def fake_get(url,*args,**kwargs):
-    if '/movie/lookup' in url:return 200,json.dumps([{'title':'Example Movie','year':2026,'tmdbId':123,'images':[]}])
+    if '/movie/lookup' in url:return 200,json.dumps([{'title':title,'year':2026,'tmdbId':123+i,'images':[{'coverType':'poster','remoteUrl':'http://127.0.0.1:19595/demo-poster.png'}]} for i,title in enumerate(['The Long Way Home','A Film With a Much Longer Title to Check Wrapping','Midnight Signals','Another Day','Quiet Waters','The Last Light'])])
     if '/qualityprofile' in url:return 200,'[{"id":1,"name":"HD"},{"id":2,"name":"Ultra HD"}]'
     if '/rootfolder' in url:return 200,'[{"id":1,"path":"/movies"},{"id":2,"path":"/movies-4k"}]'
     if '/system/status' in url:return 200,'{}'
     if '/health' in url:return 200,'[]'
     if '/queue' in url:return 200,'{"records":[],"totalRecords":0}'
     raise ValueError('Preview only: unsupported request')
+# A large raster image reproduces the intrinsic-size poster regression.
+import struct, zlib, binascii
+def chunk(kind, data):
+    return struct.pack('!I',len(data))+kind+data+struct.pack('!I',binascii.crc32(kind+data)&0xffffffff)
+poster=b'\x89PNG\r\n\x1a\n'+chunk(b'IHDR',struct.pack('!2I5B',1200,1800,8,2,0,0,0))+chunk(b'IDAT',zlib.compress((b'\0'+bytes([45,68,100])*1200)*1800))+chunk(b'IEND',b'')
+original_get=m.Handler.do_GET
+def preview_get(self):
+    if self.path=='/demo-poster.png':
+        self.send_response(200);self.send_header('Content-Type','image/png');self.send_header('Content-Length',str(len(poster)));self.end_headers();self.wfile.write(poster)
+    else: original_get(self)
+m.Handler.do_GET=preview_get
+m._fetch_bytes=lambda *args,**kwargs:(poster,'image/png')
 m.http_get=fake_get
 m._arr_post=lambda *args,**kwargs:(201,'{}')
 m.get_torrents=lambda cfg:{'ok':True,'source':'combined','downloading':[{'name':'Example download','state':'Downloading','progress':45,'size':5000000000,'dlspeed':5000000,'eta':600,'protocol':'usenet','client':'Usenet'}],'seeding':[],'errors':[]}

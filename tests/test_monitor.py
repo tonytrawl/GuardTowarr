@@ -152,7 +152,7 @@ class MonitorTests(unittest.TestCase):
         self.enable('radarr');self.enable('qbittorrent')
         self.cfg['beta'].update(malware_autoremove=True,malware_extensions=['exe'])
         results={'radarr':{'level':'ok','errors':[]}}
-        with patch.object(m,'_qbit_login',return_value=('http://x','cookie')),patch.object(m,'http_get',return_value=(200,'[{"hash":"abc"}]')),patch.object(m,'arr_queue_records',return_value=[{'id':1,'movieId':1,'downloadId':'abc'}]),patch.object(m,'_qbit_scan_files',return_value=['bad.exe']),patch.object(m,'_arr_blocklist_counts',return_value=counts),patch.object(m,'execute_action',return_value=result or {'ok':False,'error':'Removal failed'}) as action:
+        with patch.object(m,'_qbit_request',return_value=(200,'[{"hash":"abc"}]')),patch.object(m,'arr_queue_records',return_value=[{'id':1,'movieId':1,'downloadId':'abc'}]),patch.object(m,'_qbit_scan_files',return_value=['bad.exe']),patch.object(m,'_arr_blocklist_counts',return_value=counts),patch.object(m,'execute_action',return_value=result or {'ok':False,'error':'Removal failed'}) as action:
             m.scan_blocked_files(self.cfg,results)
         return results,action
 
@@ -168,7 +168,7 @@ class MonitorTests(unittest.TestCase):
     def test_scan_cache_changes_with_extensions(self):
         self.enable('radarr');self.enable('qbittorrent')
         self.cfg['beta'].update(malware_autoremove=False,malware_extensions=['exe'])
-        with patch.object(m,'_qbit_login',return_value=('http://x','cookie')),patch.object(m,'http_get',return_value=(200,'[{"hash":"abc"}]')),patch.object(m,'arr_queue_records',return_value=[{'id':1,'movieId':1,'downloadId':'abc'}]),patch.object(m,'_qbit_scan_files',side_effect=[[],['bad.scr']]) as scan:
+        with patch.object(m,'_qbit_request',return_value=(200,'[{"hash":"abc"}]')),patch.object(m,'arr_queue_records',return_value=[{'id':1,'movieId':1,'downloadId':'abc'}]),patch.object(m,'_qbit_scan_files',side_effect=[[],['bad.scr']]) as scan:
             m.scan_blocked_files(self.cfg,{'radarr':{'level':'ok','errors':[]}})
             self.cfg['beta']['malware_extensions']=['exe','scr']
             result={'radarr':{'level':'ok','errors':[]}}
