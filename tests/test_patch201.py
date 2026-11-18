@@ -38,7 +38,7 @@ class PatchTests(unittest.TestCase):
         self.assertFalse(m.missing_credentials(svc))
         m._qbit_request(svc,'torrents/info')
         self.assertEqual(len(self.calls),1)
-        self.assertEqual(self.calls[0][2]['X-Api-Key'],'fixture-key')
+        self.assertEqual(self.calls[0][2]['Authorization'],'Bearer fixture-key')
         self.assertNotIn('Cookie',self.calls[0][2])
     def test_bad_login_cooldown(self):
         self.bad_login=True

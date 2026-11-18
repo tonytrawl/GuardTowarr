@@ -31,7 +31,7 @@ import tempfile
 import shutil
 import socket
 import http.client
-from http.cookies import SimpleCookie
+from http.cookies import SimpleCookie, CookieError
 import ipaddress
 import threading
 import concurrent.futures
@@ -60,7 +60,7 @@ PORT = int(os.environ.get("GUARDTOWARR_PORT", "9595"))  # 9595: avoids Readarr's
 POLL_INTERVAL = 30  # seconds (default)
 
 # Bump this when you cut a new GitHub release (must match the release tag, e.g. v1.0.0).
-CURRENT_VERSION = "v2.0.1"
+CURRENT_VERSION = "v2.0.2"
 GITHUB_REPO = "tonytrawl/GuardTowarr"
 RELEASES_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 RELEASES_PAGE = f"https://github.com/{GITHUB_REPO}/releases/latest"
@@ -706,8 +706,18 @@ def check_seerr(name, cfg):
                     DOC_LINKS.get("seerr_unreachable", ""))])
 
 
+def jellyfin_headers(key):
+    """Standard MediaBrowser auth; no machine identity or credentials in URLs."""
+    if any(ord(c) < 32 or ord(c) == 127 for c in key):
+        raise ValueError("Jellyfin API key contains invalid control characters.")
+    token = key.replace("\\", "\\\\").replace('"', '\\"')
+    return {"Authorization": 'MediaBrowser Client="GuardTowarr", Device="GuardTowarr", '
+            'DeviceId="guardtowarr", Version="' + CURRENT_VERSION.lstrip("v") + '", Token="' + token + '"',
+            "Accept": "application/json"}
+
+
 def check_jellyfin(name, cfg):
-    """Jellyfin health check. Auth is an API key via the X-Emby-Token header;
+    """Jellyfin health check. Auth uses the standard MediaBrowser Authorization header;
     /System/Info returns 200 with a valid key. (Live now-playing is read
     separately from /Sessions in the stats code.) Jellyfin support is beta and
     limited to monitoring + live stats."""
@@ -715,8 +725,8 @@ def check_jellyfin(name, cfg):
     key = cfg.get("api_key", "")
     if not key:
         return svc_result(name, "warning", "No API key configured", [])
-    headers = {"X-Emby-Token": key, "Accept": "application/json"}
     try:
+        headers = jellyfin_headers(key)
         status, body = http_get(f"{base}/System/Info", headers)
         if status != 200:
             return svc_result(name, "error", f"Returned HTTP {status}",
@@ -724,8 +734,14 @@ def check_jellyfin(name, cfg):
                         f"Jellyfin returned HTTP {status} (the API key may be wrong).",
                         DOC_LINKS.get("jellyfin_http", ""))])
         return svc_result(name, "ok", "Online", [])
-    except Exception as e:
-        return svc_result(name, "error", f"Unreachable: {e}",
+    except urllib.error.HTTPError as e:
+        e.close()
+        message = f"Jellyfin GET /System/Info returned HTTP {e.code} using MediaBrowser authorization."
+        if e.code in (401, 403):
+            message += " Check the API key and whether a proxy is rejecting authorization."
+        return svc_result(name, "error", message, [_issue("error", "HTTP / authentication", message, DOC_LINKS.get("jellyfin_http", ""))])
+    except Exception:
+        return svc_result(name, "error", "Jellyfin GET /System/Info failed before a valid response; check connectivity, TLS, and API-key formatting.",
             [_issue("error", "Unreachable",
                     "Couldn't reach Jellyfin. Check the address and that the service is running.",
                     DOC_LINKS.get("jellyfin_unreachable", ""))])
@@ -1471,6 +1487,15 @@ def _qbit_request(svc, endpoint, method="GET", data=None):
         def fail(message):
             session.update(cookie="", expires=0, retry_at=time.monotonic()+60, error=message)
             raise QbitRequestError(message)
+        def diagnostic(endpoint, method, status=None):
+            # Only fixed endpoint paths and controlled state; never response bodies,
+            # exception text, hosts, query values, cookies, or credential headers.
+            path = endpoint.split("?", 1)[0]
+            if not re.fullmatch(r"[a-zA-Z]+/[a-zA-Z]+", path):
+                path = "request"
+            auth = "API-key" if api_key else "username/password"
+            cookie_state = "present" if session["cookie"] else "absent"
+            return f"qBittorrent {method} /api/v2/{path}: " + (f"HTTP {status}" if status else "connection/TLS failure") + f"; auth={auth}; session cookie={cookie_state}."
         def login():
             if not svc.get("username") or not svc.get("password"):
                 fail("Configure a qBittorrent API key or a Web UI username and password.")
@@ -1478,22 +1503,27 @@ def _qbit_request(svc, endpoint, method="GET", data=None):
             req = urllib.request.Request(base + "/api/v2/auth/login", data=payload, headers=headers)
             try:
                 with safe_urlopen(req, timeout=10) as response:
+                    login_status = response.status
                     body = response.read().decode("utf-8", "replace").strip()
                     cookies = SimpleCookie()
                     for value in response.headers.get_all("Set-Cookie", []):
                         cookies.load(value)
             except urllib.error.HTTPError as e:
+                e.close()
                 if e.code in (401, 403):
-                    fail("qBittorrent login rejected (HTTP %s). Check its Web UI log for an IP ban, proxy/host validation, or invalid credentials." % e.code)
-                raise
-            if body != "Ok.":
-                fail("qBittorrent rejected the username/password. Check the Web UI credentials.")
-            cookie = "SID=" + cookies["SID"].value if "SID" in cookies else ""
-            # Ok. without SID is supported for explicitly configured auth bypass.
+                    fail(diagnostic("auth/login", "POST", e.code) + " Login rejected. Check IP bans, proxy/host validation, and credentials.")
+                raise QbitRequestError(diagnostic("auth/login", "POST", e.code)) from None
+            except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException, CookieError):
+                raise QbitRequestError(diagnostic("auth/login", "POST")) from None
+            cookie = "; ".join(morsel.OutputString(attrs=[]) for name, morsel in cookies.items()
+                               if name == "SID" or re.fullmatch(r"QBT_SID_[0-9]+", name))
+            if not ((login_status == 200 and body == "Ok.") or (login_status == 204 and not body and cookie)):
+                fail(diagnostic("auth/login", "POST", login_status) + " Unexpected login response; check username/password or a proxy login page.")
+            # Ok. without a session cookie supports explicitly configured auth bypass.
             session.update(cookie=cookie, expires=time.monotonic()+600, retry_at=0)
         cached = session["expires"] > time.monotonic()
         if api_key:
-            headers["X-API-Key"] = api_key
+            headers["Authorization"] = "Bearer " + api_key
         elif not cached:
             login()
         for attempt in range(2):
@@ -1505,14 +1535,17 @@ def _qbit_request(svc, endpoint, method="GET", data=None):
                 with safe_urlopen(req, timeout=15) as response:
                     return response.status, response.read().decode("utf-8", "replace")
             except urllib.error.HTTPError as e:
+                e.close()
                 if e.code not in (401, 403):
-                    raise
+                    raise QbitRequestError(diagnostic(endpoint, method, e.code)) from None
                 if api_key:
-                    fail("qBittorrent rejected API-key access (HTTP %s). Check the key, API-key support in this version, and proxy/host rules." % e.code)
+                    fail(diagnostic(endpoint, method, e.code) + " Check the key, API-key support in this version, and proxy/host rules.")
                 if cached and attempt == 0 and method == "GET":
                     login()
                     continue
-                fail("qBittorrent denied %s (HTTP %s). Check session access, IP bans, and proxy/host rules in its Web UI log." % (endpoint.split("?", 1)[0], e.code))
+                fail(diagnostic(endpoint, method, e.code) + " Check session access, IP bans, and proxy/host rules.")
+            except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException, CookieError):
+                raise QbitRequestError(diagnostic(endpoint, method)) from None
 
 
 # qBittorrent states grouped into the two tabs
@@ -2282,7 +2315,7 @@ def _jellyfin_sessions(svc):
     if not key:
         return None
     try:
-        _, body = http_get(f"{base}/Sessions", {"X-Emby-Token": key, "Accept": "application/json"}, timeout=12)
+        _, body = http_get(f"{base}/Sessions", jellyfin_headers(key), timeout=12)
         data = json.loads(body) if body.strip() else []
         streams = []
         for s in data:
@@ -2438,7 +2471,7 @@ def _jellyfin_library_counts(svc):
     if not key:
         return None
     try:
-        _, body = http_get(f"{base}/Items/Counts", {"X-Emby-Token": key, "Accept": "application/json"}, timeout=12)
+        _, body = http_get(f"{base}/Items/Counts", jellyfin_headers(key), timeout=12)
         data = json.loads(body) if body.strip() else {}
         return {"movies": data.get("MovieCount", 0), "episodes": data.get("EpisodeCount", 0)}
     except Exception:

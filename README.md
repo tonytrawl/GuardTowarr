@@ -115,6 +115,13 @@ The system-tray feature is desktop-only and isn't part of the Docker image; the 
 
 ---
 
+## What's new in 2.0.2?
+
+Jellyfin gets updated authentication across health checks and stats. qBittorrent
+now handles both session-cookie formats, with clearer errors to help track down
+connection and login problems. Your existing credentials stay in place.
+See the [patch notes](RELEASE_NOTES_v2.0.2.md).
+
 ## What's new in 2.0.1?
 
 A quick round of fixes from your 2.0 reports: properly sized Safari posters,
